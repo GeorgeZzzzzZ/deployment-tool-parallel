@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+dist-*/
+*.log
+*.tmp
+.pytest_cache/
+.mypy_cache/
+.agents/
