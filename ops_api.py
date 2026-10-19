@@ -1,5 +1,7 @@
 import base64
+import copy
 import json
+import threading
 import time
 from urllib.parse import quote, urlsplit
 
@@ -98,6 +100,9 @@ class OpsApiClient:
         self.user = {}
         self.authenticated = False
         self._targets = {}
+        self._projects_cache = {}
+        self._options_cache = {}
+        self._options_lock = threading.RLock()
 
     @staticmethod
     def _public_key_pem(value):
@@ -128,6 +133,10 @@ class OpsApiClient:
         return payload.get("data", payload) if isinstance(payload, dict) else payload
 
     def login(self, platform_url, username, password):
+        self.authenticated = False
+        self._projects_cache.clear()
+        self._options_cache.clear()
+        self._targets.clear()
         origin = f"{urlsplit(platform_url).scheme}://{urlsplit(platform_url).netloc}"
         app_info = self._json_request(
             "GET", f"{origin}/assets/appinfo/modules-cn.json", headers={"Client-Agent": "web"}
@@ -196,7 +205,14 @@ class OpsApiClient:
             raise OpsApiError("Ops API 尚未登录")
         return self._json_request(method, BFF_BASE_URL + path, **kwargs)
 
-    def list_projects(self, cloud):
+    def list_projects(self, cloud, *, refresh=False):
+        with self._options_lock:
+            key = str(cloud).strip().lower()
+            if refresh or key not in self._projects_cache:
+                self._projects_cache[key] = self._fetch_projects(cloud)
+            return list(self._projects_cache[key])
+
+    def _fetch_projects(self, cloud):
         payload = self._data(
             self._bff(
                 "GET",
@@ -212,7 +228,22 @@ class OpsApiClient:
                 names.append(name)
         return names
 
-    def load_target_options(self, project, cloud):
+    def load_target_options(self, project, cloud, *, refresh=False):
+        with self._options_lock:
+            key = (str(project).strip().upper(), str(cloud).strip().lower())
+            if refresh or key not in self._options_cache:
+                options = self._fetch_target_options(project, cloud)
+                # Replace only after every query succeeds, including removed targets.
+                self._targets = {
+                    target_key: value for target_key, value in self._targets.items()
+                    if (target_key[0], target_key[2]) != key
+                }
+                for target in options["targets"]:
+                    self._targets[(key[0], str(target["typeId"]), key[1], target["region"])] = target
+                self._options_cache[key] = options
+            return copy.deepcopy(self._options_cache[key])
+
+    def _fetch_target_options(self, project, cloud):
         app = str(project).strip().lower()
         groups = self._data(
             self._bff(
@@ -257,13 +288,7 @@ class OpsApiClient:
                 target["project"] = project
                 target["deploy_type_label"] = label
                 targets.append(target)
-                self._targets[
-                    (str(project).upper(), type_id, cloud.lower(), target["region"])
-                ] = target
-        regions = []
-        for target in targets:
-            if target["region_label"] not in regions:
-                regions.append(target["region_label"])
+        regions = list(dict.fromkeys(target["region_label"] for target in targets))
         return {"types": types, "regions": regions, "targets": targets}
 
     def load_package_target_options(self, package, cloud):
@@ -419,7 +444,12 @@ class OpsApiClient:
         # Verify acceptance by querying the same deployment unit. This check is
         # read-only and prevents the client from reporting success on a lost click.
         for _ in range(6):
-            rows = self._deployment_records(target)
+            try:
+                rows = self._deployment_records(target)
+            except OpsApiError as exc:
+                raise OpsSubmissionUnknown(
+                    "部署已提交，但无法查询部署记录，请先到 Ops 平台核对，禁止直接重试"
+                ) from exc
             if any(
                 str(row.get("imageName", "")) == package
                 and self._record_fingerprint(row) not in old_records

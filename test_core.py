@@ -1,5 +1,6 @@
 import unittest
 import threading
+import shlex
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -18,31 +19,63 @@ from core import (
     yaml_image_reference,
 )
 from main import (
+    _environment_validation_error,
     _portable_master_key,
     browser_session_token,
     clean_remote_output_line,
     connect_ssh_client,
     create_browser_driver,
     DeployTool,
+    EnvironmentDialog,
     ENVIRONMENT_FIELDS,
     JENKINS_JOB_CACHE_VERSION,
     JenkinsClient,
+    PipelineCancelled,
     exception_message,
     format_transfer_bytes,
     parse_transfer_progress,
     platform_config_dir,
     protect_secret,
     service_type_matches,
+    shell_quote,
     unprotect_secret,
 )
 from main import RemoteCommandInterrupted
-from ops_api import OpsApiClient, OpsSubmissionUnknown, service_type_id, target_regions
+from ops_api import OpsApiClient, OpsApiError, OpsSubmissionUnknown, service_type_id, target_regions
 
 
 PACKAGE = "etmbackend-yisen-5.2.0:5.2.0.1001.10345"
 
 
 class OpsApiTests(unittest.TestCase):
+    def test_record_query_failure_after_submission_is_unknown_and_never_reposts(self):
+        client = OpsApiClient()
+        client.resolve_target = Mock(return_value={
+            "cloud": "Huawei", "api_area": "test", "appId": "etm",
+            "typeId": "backend", "deploymentName": "etm",
+        })
+        client.verify_package = Mock(return_value=True)
+        client._deployment_records = Mock(side_effect=[[], OpsApiError("offline")])
+        client._bff = Mock(return_value={"code": 0})
+
+        with self.assertRaisesRegex(OpsSubmissionUnknown, "禁止直接重试"):
+            client.deploy({"package": PACKAGE})
+
+        self.assertEqual(client._bff.call_count, 1)
+        self.assertEqual(client._bff.call_args.args[0], "POST")
+
+    def test_record_query_failure_before_submission_does_not_post(self):
+        client = OpsApiClient()
+        client.resolve_target = Mock(return_value={})
+        client.verify_package = Mock(return_value=True)
+        client._deployment_records = Mock(side_effect=OpsApiError("offline"))
+        client._bff = Mock()
+
+        with self.assertRaisesRegex(OpsApiError, "offline"):
+            client.deploy({"package": PACKAGE})
+
+        client._bff.assert_not_called()
+
     def test_ops_business_success_code_is_accepted(self):
         client = OpsApiClient()
         response = Mock()
@@ -395,12 +428,21 @@ class CoreTests(unittest.TestCase):
         item = Mock()
         item.data.return_value = {"path": ["folder"], "is_folder": True}
         item.childCount.return_value = 1
-        tool = SimpleNamespace(jenkins=object(), run_thread=Mock(), emit=Mock())
+        item.text.return_value = "folder"
+        item.parent.return_value = None
+        tool = SimpleNamespace(
+            jenkins=object(), run_thread=Mock(), emit=Mock(), path_label=Mock(),
+            _sync_cloud_target_from_job=Mock(), _update_build_cloud_ready=Mock(),
+            _select_build_summary=Mock(),
+            build_button=Mock(),
+        )
 
         DeployTool._tree_select(tool, item, 0)
 
         tool.run_thread.assert_not_called()
         tool.emit.assert_not_called()
+        self.assertEqual(tool.current_job_path, [])
+        tool._sync_cloud_target_from_job.assert_called_once()
 
     @patch("main.sys.platform", "win32")
     def test_visible_browser_uses_eager_page_loading(self):
@@ -756,16 +798,17 @@ class CoreTests(unittest.TestCase):
         second_owner.emit.assert_called_once_with("open_dashboard_item", second_dashboard)
 
     @patch("main.QMessageBox.information")
-    def test_dashboard_login_success_uses_in_app_overlay(self, information):
+    def test_dashboard_login_success_logs_without_a_popup(self, information):
         message_overlay = SimpleNamespace(show_message=Mock())
-        tool = SimpleNamespace(message_overlay=message_overlay)
+        tool = SimpleNamespace(message_overlay=message_overlay, deploy_log=Mock())
 
         with patch("main.sys.platform", "win32"):
             DeployTool._on_dashboard_login_ok(tool, "环境3（宏阳鑫）")
 
-        message_overlay.show_message.assert_called_once_with(
-            "Dashboard", "已自动登录并打开 etm Pods：环境3（宏阳鑫）"
+        tool.deploy_log.appendPlainText.assert_called_once_with(
+            "已自动登录并打开 etm Pods：环境3（宏阳鑫）"
         )
+        message_overlay.show_message.assert_not_called()
         information.assert_not_called()
 
     @patch("main.QMessageBox.information")
@@ -1245,60 +1288,6 @@ class CoreTests(unittest.TestCase):
         self.assertIs(cache["jobs"], jobs)
         self.assertRegex(cache["updated_at"], r"^\d{4}-\d{2}-\d{2} ")
         store.save.assert_called_once_with()
-
-    def test_windows_login_reuses_cache_without_starting_fetch_thread(self):
-        jobs = [{"name": "custom-dev", "children": []}]
-        store = SimpleNamespace(data={
-            "jenkins": {
-                "job_cache": {
-                    "version": JENKINS_JOB_CACHE_VERSION,
-                    "url": "https://jenkins.example",
-                    "username": "builder",
-                    "jobs": jobs,
-                },
-            },
-        }, save=Mock())
-        client = SimpleNamespace(
-            url="https://jenkins.example",
-            session=SimpleNamespace(auth=("builder", "token")),
-        )
-        tool = SimpleNamespace(
-            j_url=Mock(text=Mock(return_value="https://jenkins.example")),
-            j_user=Mock(text=Mock(return_value="builder")),
-            j_password=Mock(text=Mock(return_value="token")),
-            store=store,
-            jenkins=None,
-            job_search_timer=Mock(),
-            job_filter_input=Mock(),
-            job_cache_refresh_button=Mock(),
-            _job_cache_generation=0,
-            _job_filter_active=False,
-            _job_filter_expanded_state={},
-            job_tree_cache=[],
-            job_tree=Mock(),
-            login_button=Mock(),
-            path_label=Mock(),
-            _load_saved_job_cache=None,
-            _render_job_cache=Mock(),
-            _count_job_cache_nodes=Mock(return_value=1),
-            emit=Mock(),
-            run_thread=Mock(),
-        )
-        tool._load_saved_job_cache = DeployTool._load_saved_job_cache.__get__(tool)
-
-        with (
-            patch("main.sys.platform", "win32"),
-            patch("main.protect_secret", return_value="encrypted"),
-            patch("main.JenkinsClient", return_value=client),
-        ):
-            DeployTool.login_jenkins(tool)
-
-        tool._render_job_cache.assert_called_once_with(jobs)
-        tool.run_thread.assert_not_called()
-        tool.emit.assert_called_once_with(
-            "jenkins_login_finished",
-            (True, "已加载 Jenkins 本地缓存，共 1 个任务"),
-        )
 
     def test_complete_saved_jenkins_credentials_trigger_auto_login(self):
         tool = SimpleNamespace(
@@ -1793,7 +1782,7 @@ class CoreTests(unittest.TestCase):
         client.get_json = Mock(return_value={"cancelled": True})
         event = threading.Event()
         event.set()
-        with self.assertRaises(Exception):
+        with self.assertRaises(PipelineCancelled):
             client.wait_for_build(
                 "http://jenkins/queue/item/1",
                 lambda line: None,
@@ -1802,6 +1791,47 @@ class CoreTests(unittest.TestCase):
         client._post_action.assert_called_once_with(
             "http://jenkins/queue/item/1/cancelQueue"
         )
+
+    @patch("main.time.sleep")
+    def test_queue_cancellation_follows_a_build_claimed_by_an_executor(self, sleep):
+        client = JenkinsClient("http://jenkins", "user", "token")
+        client._post_action = Mock()
+        client.get_json = Mock(side_effect=[
+            {"executable": {"url": "http://jenkins/job/a/12/"}},
+            {"building": True},
+            {"building": False, "result": "ABORTED"},
+        ])
+        event = threading.Event()
+        event.set()
+
+        with self.assertRaises(PipelineCancelled):
+            client.wait_for_build("http://jenkins/queue/item/1", Mock(), cancel_event=event)
+
+        self.assertEqual([call.args[0] for call in client._post_action.call_args_list], [
+            "http://jenkins/queue/item/1/cancelQueue", "http://jenkins/job/a/12/stop",
+        ])
+        self.assertEqual(client.get_json.call_count, 3)
+
+    @patch("main.time.sleep")
+    def test_cancellation_never_claims_success_without_a_stopped_build(self, sleep):
+        for response in ({"building": True}, {}):
+            with self.subTest(response=response):
+                client = JenkinsClient("http://jenkins", "user", "token")
+                client._post_action = Mock()
+                client.get_json = Mock(return_value=response)
+                with self.assertRaisesRegex(RuntimeError, "仍处于运行状态"):
+                    client.cancel_build("jenkins", "http://jenkins/job/a/12")
+                self.assertEqual([call.args[0].rsplit("/", 1)[-1]
+                                  for call in client._post_action.call_args_list],
+                                 ["stop", "term", "kill"])
+
+    @patch("main.time.sleep")
+    def test_cancellation_confirms_the_final_kill_result(self, sleep):
+        client = JenkinsClient("http://jenkins", "user", "token")
+        client._post_action = Mock()
+        client.get_json = Mock(side_effect=[{"building": True}] * 15 + [{"building": False}])
+        client.cancel_build("jenkins", "http://jenkins/job/a/12")
+        self.assertEqual(client._post_action.call_args.args[0], "http://jenkins/job/a/12/kill")
 
     def test_aborted_jenkins_build_is_reported_as_cancelled(self):
         jenkins = Mock()
@@ -1844,6 +1874,44 @@ class CoreTests(unittest.TestCase):
                 "http://jenkins/job/a/12/term",
             ],
         )
+
+
+class EnvironmentValidationTests(unittest.TestCase):
+    def test_required_fields_dashboard_and_port_boundaries(self):
+        data = {"name": "demo", "host": "example.invalid", "username": "tester", "port": "22"}
+        for port in ("1", "22", "65535"):
+            self.assertIsNone(_environment_validation_error({**data, "port": port}, True))
+        for port in ("", "0", "65536", "invalid", None):
+            with self.subTest(port=port):
+                self.assertEqual(_environment_validation_error({**data, "port": port}, True)[0], "端口无效")
+        for key in ("name", "host", "username"):
+            self.assertEqual(_environment_validation_error({**data, key: ""}, True)[0], "缺少信息")
+        self.assertEqual(_environment_validation_error(data, False)[0], "Dashboard 无效")
+
+    @patch("main.protect_secret")
+    @patch("main.QMessageBox.warning")
+    def test_both_environment_forms_reject_invalid_ports_before_saving(self, warning, protect):
+        data = {key: "" for _, key in ENVIRONMENT_FIELDS}
+        data.update(name="demo", host="example.invalid", username="tester", port="65536", dashboard="demo")
+        dialog = SimpleNamespace(vars=data, _get_value=data.__getitem__, accept=Mock())
+        EnvironmentDialog._save(dialog)
+        tool = SimpleNamespace(
+            build_env_combo=Mock(), store=SimpleNamespace(data={
+                "environments": [{"name": "demo"}],
+                "dashboards": [{"id": "demo-id", "name": "demo"}],
+            }, save=Mock()), _get_env_var=data.__getitem__,
+        )
+        tool.build_env_combo.currentText.return_value = "demo"
+        DeployTool.save_environment(tool)
+        self.assertEqual([call.args[1] for call in warning.call_args_list], ["端口无效", "端口无效"])
+        protect.assert_not_called()
+        dialog.accept.assert_not_called()
+        tool.store.save.assert_not_called()
+
+    def test_remote_shell_arguments_round_trip_without_expansion(self):
+        for value in ("", "/data/yaml/app/backend", "space path", "a'b", "$(touch sentinel);*", "line\nbreak"):
+            with self.subTest(value=value):
+                self.assertEqual(shlex.split(shell_quote(value)), [value])
 
 
 if __name__ == "__main__":

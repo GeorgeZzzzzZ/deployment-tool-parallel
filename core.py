@@ -42,7 +42,12 @@ def extract_job_project_code(path):
 def cloud_project_matches_job(path, project):
     """Require the Ops deployment project to match the selected Jenkins system."""
     job_project = extract_job_project_code(path)
-    return bool(job_project and job_project == str(project or "").strip().upper())
+    project = str(project or "").strip().upper()
+    parts = path if isinstance(path, (list, tuple)) else str(path or "").replace("\\", "/").split("/")
+    app_job = bool(parts and re.match(r"^\s*\d+\s*-\s*APP(?:\W|$)", str(parts[-1]), re.I))
+    return bool(job_project and (
+        project == job_project or (app_job and project == f"{job_project}MOBILE")
+    ))
 
 
 def ensure_dashboard_bindings(config, id_factory=None):
@@ -131,7 +136,6 @@ def reorder_parameters(parameters, path):
     names = [item.get("name") for item in result]
     if "GIT_BRANCH" not in names or "GIT_BRANCH2" not in names:
         return result
-    branch = names.index("GIT_BRANCH")
     branch2 = names.index("GIT_BRANCH2")
     item = result.pop(branch2)
     branch = next(i for i, value in enumerate(result) if value.get("name") == "GIT_BRANCH")

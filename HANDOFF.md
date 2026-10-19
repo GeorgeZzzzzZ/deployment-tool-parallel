@@ -68,7 +68,7 @@ Jenkins 构建成功
 2. `Ctrl+N` 和标题栏“新建任务”入口最终都创建新的 `DeployTool` 工作区；SSH 模式继承当前目标环境。底部任务中心只负责状态展示、任务切换和展开收起。
 3. `DeployTool._begin_tracked_task()` 冻结本次任务标题、包号和目标；构建、SSH 与 Ops 信号持续更新任务中心摘要。
 4. 一个工作区同一时间只允许一个打包或部署操作。并行操作必须新建任务，避免日志、取消事件和状态被覆盖。
-5. 运行中的任务不能移除；任一任务仍在运行或加载数据时，主窗口拒绝退出。
+5. 运行中的任务不能移除；主窗口右上角“×”隐藏到 Windows 系统托盘，任务继续在后台运行，单击托盘图标恢复。通过托盘菜单或“配置迁移 → 退出应用”请求真正退出时，仍会拒绝关闭并提示先结束运行中的任务。
 6. 任务切换只改变可见工作区，不影响后台 `Worker`、合批等待或远程命令。
 
 不要把 `DeployTool` 再改回 `Qt.Window`，也不要在任务切换时销毁或重建运行中的工作区。`windows` 属性目前表示任务集合，名称仅为旧调用兼容。
@@ -167,19 +167,26 @@ Deepin:  ${XDG_CONFIG_HOME:-~/.config}/BuildDeployToolParallel/config.json
 
 ### 登录与任务浏览
 
-`login_jenkins` 创建 `JenkinsClient`。Windows 首次登录递归读取完整任务树并将缓存写入配置，后续启动在 Jenkins 地址和账号一致时直接使用本地缓存；只有缓存不存在、无效、身份不匹配，或用户点击刷新按钮时才重新读取 Jenkins。macOS 和 Deepin 仍按任务树展开按需读取子任务。选择叶子任务后加载参数。
+`login_jenkins` 创建 `JenkinsClient`，后台通过 `/whoAmI/api/json` 验证非匿名登录身份。Windows 首次登录递归读取完整任务树，已有有效任务树缓存则在身份验证通过后复用；验证和加载全部成功才显示“登录成功”并收起连接栏，失败保持展开并显示具体错误。参数和分支按任务点击读取并缓存，不等待 Ops 目标加载。任务树刷新验证身份后只更新目录，保留已有参数和云端目标缓存，不受搜索过滤限制。macOS 和 Deepin 同样先验证身份，仍按任务树展开按需读取子任务。登录行为回归见 `test_jenkins_login.py`。
 
 需要保留的行为：
 
 - 使用 Jenkins 返回的真实 Job URL，不要仅依赖显示名称重建 URL。
 - Windows 持久缓存必须校验版本、Jenkins 地址、账号和节点结构；手动刷新成功后才覆盖旧缓存，刷新失败时保留已有缓存。
+- `selection_cache` 保存参数定义及云端界面选项，按平台地址、账号及 Job 或云厂商/专案隔离，跨任务和重启复用；缓存命中直接渲染，不创建 Worker。构建参数及分支仅在点击未缓存任务时读取，启动和任务树刷新均不遍历预加载；旧版本完整或部分缓存直接兼容，失败任务再次点击可重试。参数缓存不保存密码参数默认值，配置导出不携带此缓存。异步结果必须校验连接身份和当前请求，旧连接结果不得覆盖新连接。分支刷新只更新对应参数，云端选项加载和刷新仍遍历全部专案，真实部署仍由 API 校验。
 - Git 参数通过 Git Parameter 插件接口读取候选值。
+- `GIT_BRANCH`/`GIT_BRANCH2` 参数旁提供“刷新分支”按钮，通过 Jenkins Git Parameter 接口异步更新当前列表；刷新失败保留原列表，且不重置同一任务的其他参数。
 - 二开任务的 `GIT_BRANCH2` 为空时回退到 `GIT_BRANCH`。
 - 每个 Job 的参数值按任务路径保存。
+- 状态集仅查询当前任务工作区发起的构建，按 Jenkins 连接、Job 路径及 URL 绑定本次构建编号；切换模块使旧请求失效，手动刷新不回退到 `lastBuild`。未打包或排队取消且无编号时隐藏详情；继续打包替换该 Job 上次尝试的绑定。
+- 任务路径和打包操作栏在配置滚动区外。页签可拖动，`tab_order` 用页面 objectName 保存顺序，各任务同步；程序跳转通过页面标识定位，禁止依赖固定索引。
+- APP 任务允许对应系统的 mobile 专案（ETM → etmmobile），自动匹配前端；WEB/SERVICE 仍按原系统精确校验，不使用任意前缀匹配。
 
 ### 构建与包号
 
 `start_build` 校验配置并冻结本次目标，`_run_pipeline` 负责串联完整流程。
+
+`_launch_build` 统一启动首次构建与“继续”：启动时保存仅驻留内存的配置快照，每次尝试使用独立副本，并绑定原 Jenkins 客户端。仅已取消且全部 Worker 收尾后允许继续；重新提交完整打包流程、清除旧进度/包号并重新登记 SSH 批次。后续表单修改不得改变快照，新建其他操作时清除旧快照，失败或结果未知不得当作已停止提供继续。
 
 Jenkins 构建完成后必须满足：
 
@@ -192,7 +199,7 @@ Jenkins 构建完成后必须满足：
 
 取消不是只设置本地标志。正确语义是：
 
-- 排队阶段调用 `cancelQueue`，轮询确认队列取消或条目消失。
+- 排队阶段调用 `cancelQueue`，轮询确认队列取消或条目消失；若条目已进入构建，则继续终止对应构建。
 - 构建阶段按 `/stop -> /term -> /kill` 分级请求，并轮询 `building` 直到为 `false`。
 - 使用锁避免 UI 取消线程与构建轮询线程重复执行整套取消流程。
 - 只有确认 Jenkins 不再构建后，UI 才能显示“已确认终止”。
@@ -223,7 +230,7 @@ Jenkins 构建完成后必须满足：
 
 ## 8. Ops 云端部署流程
 
-TAB3 默认直接调用 Ops 网页使用的 IAM/BFF API，不再启动后台 Edge。旧 Selenium 方法保留在代码中仅供排障，不会自动回退，以免接口响应不明时再次点击造成重复部署。
+TAB3 通过 IAM/BFF API 加载目标并部署；显式点击“登录并加载部署数据”时，在数据加载后调用 Selenium 打开可见浏览器并自动登录 Ops 网页。刷新和后台部署不启动浏览器，网页登录失败不清除 API 会话。旧 Selenium 部署方法仍仅供排障，不会自动回退，以免接口响应不明时再次点击造成重复部署。
 
 流程：
 
@@ -242,7 +249,7 @@ TAB3 默认直接调用 Ops 网页使用的 IAM/BFF API，不再启动后台 Edg
 - 包号必须在目标镜像仓库中精确匹配，找不到时停止，绝不能选择第一项或最新项兜底。
 - 不得为部署 POST 配置 requests/urllib3 自动重试。
 - 历史中已有同包记录不能作为本次提交成功的依据。
-- 提交响应中断或轮询不到新记录时必须显示“部署结果未知”，先人工核对 Ops 记录，禁止直接重试。
+- 提交响应中断、提交后查询记录失败或轮询不到新记录时必须显示“部署结果未知”，先人工核对 Ops 记录，禁止直接重试。
 - API 字段或路径变化时，应先通过浏览器开发者工具重新确认协议，再更新 `ops_api.py`。
 - Ops 已接受的部署请求无法通过当前工具撤回，取消只对提交前有效。
 
@@ -260,7 +267,7 @@ TAB3 默认直接调用 Ops 网页使用的 IAM/BFF API，不再启动后台 Edg
 
 所有网络、SSH、Selenium 和长时间操作必须通过 `Worker(QThread)` 执行。后台线程不能直接修改 Qt 控件，应通过 `DeployTool.emit` 映射到信号，再由主线程槽函数更新 UI。
 
-任务中心折叠高度固定为 46px，展开后由底部 `QDockWidget` 占用约 270px。任务失败时自动展开；任务行点击切换 `QStackedWidget` 当前页。不要把完整任务表单复制进底栏，也不要为任务恢复默认新窗口行为。
+任务中心折叠高度固定为 46px，展开后由底部 `QDockWidget` 占用约 270px。任务失败时自动展开；任务行点击切换 `QStackedWidget` 当前页。点击包号列或选中任务后按 Ctrl+C 可复制完整包号，无包号时不修改剪贴板。环境部署左栏使用滚动容器，避免展开任务中心时压缩表单行。不要把完整任务表单复制进底栏，也不要为任务恢复默认新窗口行为。
 
 状态规则：
 
@@ -276,8 +283,8 @@ TAB3 默认直接调用 Ops 网页使用的 IAM/BFF API，不再启动后台 Edg
 每次修改至少运行：
 
 ```powershell
-python -m py_compile main.py core.py ops_api.py test_core.py test_package_inference.py test_parallel_windows.py
-python -m unittest test_core.py test_package_inference.py test_parallel_windows.py -v
+python -m py_compile main.py core.py ops_api.py test_core.py test_package_inference.py test_parallel_windows.py test_ui_regressions.py
+python -m unittest test_core.py test_package_inference.py test_parallel_windows.py test_ui_regressions.py -v
 ```
 
 修改以下区域时应补对应测试：
@@ -291,7 +298,9 @@ python -m unittest test_core.py test_package_inference.py test_parallel_windows.
 | 一键分支 | SSH 与 Ops 不互相串流程 |
 | 服务类型匹配 | 大小写、空格、前端/后端区分 |
 | 配置迁移 | Dashboard ID 绑定与重命名 |
+| Jenkins 参数 | 分支刷新成功/失败、其他参数值保留 |
 | 任务中心 | 子任务不是系统窗口、折叠/失败展开、切换/移除、运行中禁止重入 |
+| 主窗口生命周期 | 右上角关闭最小化、显式退出受运行状态保护 |
 
 真实环境验证要谨慎：
 
@@ -313,7 +322,7 @@ Deepin:  build-deepin.sh
 产物：
 
 ```text
-Windows: dist/DeployConsoleBatchSafe.exe
+Windows: release/DeployConsoleBatchSafe.exe
 macOS:   dist/DeployConsoleParallel.app、dist/DeployConsoleParallel-macos.dmg
 Deepin:  dist/DeployConsoleParallel、dist/DeployConsoleParallel-deepin25-x86_64.tar.gz
 ```
@@ -330,6 +339,8 @@ Deepin:  dist/DeployConsoleParallel、dist/DeployConsoleParallel-deepin25-x86_64
 8. Deepin 在真实 DDE 桌面验证 XCB、剪贴板和 Chrome/Chromium 自动登录。
 
 不要继续创建 `stable`、`new`、`v2`、`v3` 等临时 spec 或历史 EXE。需要版本号时使用 Git tag 或发行记录，不要依赖文件名管理历史。
+
+Windows 打包配置会在依赖分析前自动从当前进程 PATH 排除 `codex-runtimes` 下的工具目录，避免误收 Poppler 的 `icuuc.dll` 而导致 QtCore 加载失败。切换打包环境后应使用 `--clean`（`build.bat` 已包含）或独立 workpath。可运行 `python -m unittest test_build_spec -v` 回归此隔离规则；交付前必须执行 EXE 的两项自检。
 
 ## 13. 已知风险与后续建议
 

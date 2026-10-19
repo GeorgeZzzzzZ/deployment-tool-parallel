@@ -1,7 +1,10 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -371,6 +374,89 @@ class ParallelWindowTests(unittest.TestCase):
         event.accept.assert_not_called()
         warning.assert_called_once()
 
+    def test_branch_refresh_button_fetches_latest_choices_without_resetting_other_values(self):
+        store = SimpleNamespace(
+            data={
+                "jenkins": {"values": {}},
+                "environments": [],
+                "dashboards": [],
+            },
+            save=Mock(),
+        )
+        tool = DeployTool(store=store, task_number=1, embedded=True)
+        tool.current_job_path = ["云应用打包", "service"]
+        tool.current_job_url = "https://jenkins.example/job/service"
+        tool._show_parameters(
+            tool.current_job_path,
+            [
+                {
+                    "name": "GIT_BRANCH",
+                    "type": "GitParameterDefinition",
+                    "choices": ["origin/old"],
+                    "defaultParameterValue": {"value": "origin/old"},
+                },
+                {
+                    "name": "folderName",
+                    "type": "StringParameterDefinition",
+                    "defaultParameterValue": {"value": "app_backend"},
+                },
+            ],
+        )
+        tool.param_vars["folderName"][1].setText("user-entered")
+        client = SimpleNamespace(
+            url="https://jenkins.example",
+            get_git_parameter_choices=Mock(
+                return_value=["origin/new", "origin/new", "origin/main"]
+            ),
+        )
+        tool.jenkins = client
+
+        # Execute the worker body synchronously; the production path uses a
+        # QThread, while this keeps the regression test deterministic.
+        def run_inline(function, on_finished=None):
+            function()
+            if on_finished:
+                on_finished()
+
+        tool.run_thread = run_inline
+        tool.refresh_branch_choices("GIT_BRANCH")
+
+        branch_widget = tool.param_vars["GIT_BRANCH"][1]
+        self.assertEqual(branch_widget.values(), ["origin/new", "origin/main"])
+        self.assertEqual(branch_widget.currentText(), "origin/new")
+        self.assertEqual(
+            tool.param_vars["folderName"][1].text(), "user-entered"
+        )
+        client.get_git_parameter_choices.assert_called_once_with(
+            tool.current_job_url, "GIT_BRANCH"
+        )
+        tool.deleteLater()
+        self.qt_app.processEvents()
+
+    def test_main_window_close_hides_to_tray_and_explicit_exit_still_closes(self):
+        store = SimpleNamespace(data=ConfigStore._default_data(), save=Mock())
+        manager = ApplicationWindowManager(self.qt_app, store=store)
+        manager.create_window()
+        manager.show()
+        self.qt_app.processEvents()
+
+        manager.tray_available = True
+        close_event = Mock()
+        manager.closeEvent(close_event)
+        self.assertTrue(manager._hidden_to_tray)
+        self.assertFalse(manager.isVisible())
+        close_event.ignore.assert_called_once_with()
+        close_event.accept.assert_not_called()
+
+        manager.restore_from_tray()
+        self.assertTrue(manager.isVisible())
+        self.assertFalse(manager._hidden_to_tray)
+        quit_app = Mock()
+        manager.app = SimpleNamespace(quit=quit_app)
+        self.assertTrue(manager.request_exit())
+        quit_app.assert_called_once_with()
+        self.qt_app.processEvents()
+
     def test_new_parallel_task_inherits_current_ssh_environment(self):
         class Combo:
             def __init__(self, value):
@@ -506,7 +592,10 @@ class ParallelWindowTests(unittest.TestCase):
         self, monotonic, sleep
     ):
         tool = SimpleNamespace(
-            _remote_command_succeeded=Mock(side_effect=[False, True]),
+            _probe_remote_image=Mock(side_effect=[
+                (False, "仓库返回镜像未找到，等待仓库同步（退出码 1）"),
+                (True, ""),
+            ]),
             emit=Mock(),
         )
 
@@ -517,7 +606,7 @@ class ParallelWindowTests(unittest.TestCase):
             timeout_seconds=30,
         )
 
-        self.assertEqual(tool._remote_command_succeeded.call_count, 2)
+        self.assertEqual(tool._probe_remote_image.call_count, 2)
         sleep.assert_called_once_with(3)
         self.assertTrue(
             any("等待仓库同步" in call.args[1] for call in tool.emit.call_args_list)
@@ -527,7 +616,7 @@ class ParallelWindowTests(unittest.TestCase):
         cancel_event = threading.Event()
         cancel_event.set()
         tool = SimpleNamespace(
-            _remote_command_succeeded=Mock(),
+            _probe_remote_image=Mock(),
             emit=Mock(),
         )
 
@@ -539,7 +628,7 @@ class ParallelWindowTests(unittest.TestCase):
                 cancel_event=cancel_event,
             )
 
-        tool._remote_command_succeeded.assert_not_called()
+        tool._probe_remote_image.assert_not_called()
 
     def test_ssh_target_keys_allow_different_yamls_in_same_environment(self):
         first = DeployTool._deployment_target_key(
@@ -582,6 +671,138 @@ class ParallelWindowTests(unittest.TestCase):
         self.assertEqual(first, same)
         self.assertNotEqual(first, same_host_different_product)
         self.assertNotEqual(first, different)
+
+
+class SingleApplicationInstanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.qt_app = main.QApplication.instance() or main.QApplication([])
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+
+    def instance(self, directory=None):
+        instance = main.SingleApplicationInstance(directory or self.directory)
+        self.addCleanup(instance.close)
+        return instance
+
+    def test_repeated_start_restores_hidden_window_without_another_tray(self):
+        primary = self.instance()
+        self.assertTrue(primary.acquire())
+        manager = ApplicationWindowManager(self.qt_app, store=SimpleNamespace(data={}))
+        manager.tray_available = True
+        self.addCleanup(manager.deleteLater)
+        self.addCleanup(manager.tray_icon.hide)
+        primary.activation_requested.connect(manager.restore_from_tray)
+        for _ in range(4):
+            manager.hide_to_tray()
+            secondary = self.instance()
+            self.assertFalse(secondary.acquire())
+            secondary.close()
+            deadline = time.monotonic() + 2
+            while not manager.isVisible() and time.monotonic() < deadline:
+                self.qt_app.processEvents()
+                time.sleep(0.01)
+            self.assertTrue(manager.isVisible())
+            self.assertFalse(manager._hidden_to_tray)
+            self.assertEqual(len(manager.findChildren(main.QSystemTrayIcon)), 1)
+
+    def test_exit_releases_lock_and_different_config_is_independent(self):
+        primary = self.instance()
+        self.assertTrue(primary.acquire())
+        self.assertTrue(self.instance(self.directory / "other-user").acquire())
+        primary.close()
+        self.assertTrue(self.instance().acquire())
+
+    def test_locked_but_unresponsive_owner_does_not_start_another_app(self):
+        primary = self.instance()
+        self.assertTrue(primary.acquire())
+        primary.server.close()
+        with self.assertRaisesRegex(RuntimeError, "应用已在运行"):
+            self.instance().acquire(timeout_ms=100)
+
+    def test_listener_failure_releases_lock(self):
+        primary = self.instance()
+        with patch.object(primary.server, "listen", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "无法创建应用启动通道"):
+                primary.acquire()
+        self.assertTrue(self.instance().acquire())
+
+    def test_secondary_start_exits_before_creating_window_or_reading_config(self):
+        with (
+            patch("main.QApplication"),
+            patch("main.SingleApplicationInstance") as instance_type,
+            patch("main.ApplicationWindowManager") as manager_type,
+            patch("main.ConfigStore") as store_type,
+        ):
+            instance_type.return_value.acquire.return_value = False
+            self.assertEqual(main.run_application(), 0)
+            manager_type.assert_not_called()
+            store_type.assert_not_called()
+            instance_type.return_value.close.assert_called_once_with()
+
+    def test_simultaneous_processes_have_one_owner_and_recover_after_crash(self):
+        worker = """
+import os, sys, time
+from pathlib import Path
+from PySide6.QtCore import QCoreApplication, QTimer
+from main import SingleApplicationInstance
+app = QCoreApplication([])
+root = Path(sys.argv[1])
+while not (root / 'start').exists():
+    time.sleep(0.01)
+instance = SingleApplicationInstance(root / 'config')
+primary = instance.acquire()
+(root / (str(os.getpid()) + '.result')).write_text(str(primary))
+if primary:
+    def activated():
+        with (root / 'activations').open('a') as output:
+            output.write('1')
+    instance.activation_requested.connect(activated)
+    QTimer.singleShot(15000, app.quit)
+    app.exec()
+instance.close()
+"""
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker, str(self.directory)],
+                cwd=str(Path(main.__file__).parent),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for _ in range(5)
+        ]
+        try:
+            (self.directory / "start").touch()
+            deadline = time.monotonic() + 12
+            while len(list(self.directory.glob("*.result"))) != 5:
+                self.assertLess(time.monotonic(), deadline, "startup timed out")
+                time.sleep(0.02)
+            results = {
+                process.pid: (self.directory / f"{process.pid}.result").read_text()
+                for process in workers
+            }
+            self.assertEqual(list(results.values()).count("True"), 1)
+            owner = next(process for process in workers if results[process.pid] == "True")
+            for process in workers:
+                if process is not owner:
+                    _stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
+            activations = self.directory / "activations"
+            while not activations.exists() or activations.read_text() != "1111":
+                self.assertLess(time.monotonic(), deadline, "activation timed out")
+                time.sleep(0.02)
+            # Kill only the isolated test owner, leaving its lock file behind.
+            owner.kill()
+            owner.communicate(timeout=5)
+            self.assertTrue(self.instance(self.directory / "config").acquire())
+        finally:
+            for process in workers:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
 
 
 if __name__ == "__main__":

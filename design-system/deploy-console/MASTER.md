@@ -1,5 +1,15 @@
 # Design System Master File
 
+## 2026-09-24 桌面主题覆盖规则
+
+- 以下规则优先于旧版通用网页建议；保持现有 Qt 桌面布局和工作流。
+- 复用迁移工具的深蓝渐变与玫红、琥珀、青蓝、紫色柔光；不加载网络字体或素材。
+- 玻璃卡片为 16px 圆角、半透明白色填充、1px 渐变高光描边；悬停为 200ms InOutCubic。
+- Windows 减少动画时直接切换状态，不改变控件布局；日志与弹出菜单使用更深底色。
+- 普通主操作使用蓝紫渐变，执行使用深绿渐变，危险操作保留红色与文字。
+- 正文、输入框、列表与启用状态按钮文字对比度至少 4.5:1；焦点必须可见。
+- 使用本地 Lucide SVG 与 Uiverse 线条发送图标，保留中文名称、提示与各自开源许可。
+
 > **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.
 > If that file exists, its rules **override** this Master file.
 > If not, strictly follow the rules below.

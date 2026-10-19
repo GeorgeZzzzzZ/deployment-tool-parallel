@@ -1,7 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 import sys
 
 from PyInstaller.utils.hooks import collect_all
+
+# Codex adds native tool directories to PATH. Their Poppler ICU DLL uses a
+# different ABI from the Windows ICU that Qt imports, so do not collect it.
+if sys.platform == 'win32':
+    os.environ['PATH'] = os.pathsep.join(
+        entry for entry in os.environ.get('PATH', '').split(os.pathsep)
+        if 'codex-runtimes' not in entry.lower()
+    )
 
 executable_name = (
     'DeployConsoleBatchSafe' if sys.platform == 'win32' else 'DeployConsoleParallel'
@@ -15,7 +24,11 @@ elif sys.platform == 'darwin':
 datas = []
 binaries = []
 hiddenimports = []
-datas += [('assets/deploy-console-parallel.png', 'assets')]
+datas += [
+    ('assets/deploy-console-parallel.png', 'assets'),
+    ('assets/lucide', 'assets/lucide'),
+    ('assets/uiverse', 'assets/uiverse'),
+]
 tmp_ret = collect_all('selenium')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

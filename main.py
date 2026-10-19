@@ -2,6 +2,7 @@ import base64
 import codecs
 import copy
 import ctypes
+import hashlib
 import importlib
 import json
 import os
@@ -14,7 +15,9 @@ import time
 import uuid
 import webbrowser
 from ctypes import wintypes
+from functools import lru_cache
 from pathlib import Path
+from shlex import quote as shell_quote
 
 import paramiko
 import requests
@@ -22,13 +25,15 @@ from cryptography.fernet import Fernet
 from PySide6.QtCore import (
     QObject, QThread, Qt, Signal, Slot, QPoint, QSize, QRectF, QStringListModel,
     QSortFilterProxyModel, QTimer, QEvent, QEventLoop, QPropertyAnimation,
-    QEasingCurve,
+    QEasingCurve, QLockFile,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QColor, QFont, QFontDatabase, QIcon, QPainter, QPalette, QAction,
     QLinearGradient, QPen, QBrush, QMouseEvent, QPolygon, QKeySequence,
-    QShortcut,
+    QShortcut, QPixmap, QPainterPath,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
@@ -37,8 +42,9 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QMessageBox, QInputDialog, QDialog,
     QDialogButtonBox, QCompleter, QSpacerItem, QAbstractItemView,
     QHeaderView, QStackedWidget, QToolButton, QProxyStyle, QStyle, QFileDialog, QMenu,
-    QDockWidget,
+    QDockWidget, QSystemTrayIcon,
 )
+from deploy_glass import GlassBackground, GlassPanel, WrappingActionLayout, is_reduced_motion
 
 
 from core import (
@@ -47,6 +53,7 @@ from core import (
     ensure_dashboard_bindings,
     extract_job_project_code,
     extract_package_number,
+    infer_cloud_deployment_config,
     infer_ssh_deployment_config,
     is_secondary_build_path,
     jenkins_job_api_url,
@@ -58,44 +65,59 @@ from core import (
     update_yaml_image,
     yaml_image_reference,
 )
-from ops_api import OpsApiClient, OpsApiError, OpsSubmissionUnknown
+from ops_api import (
+    OpsApiClient, OpsApiError, OpsSubmissionUnknown, service_type_id, service_type_label,
+)
 
-# ── Color Palette (Bento Box / Modern SaaS) ──────────────────────────
+# ── Color Palette (Glassmorphism / Frosted Glass / Modern SaaS) ─────
 COLORS = {
-    "bg": "#0B1220",
-    "card": "#111C2E",
-    "card_hover": "#17243A",
-    "border": "#2A3A52",
+    "bg": "#0B1020",
+    "card": "rgba(255, 255, 255, 0.05)",
+    "card_hover": "rgba(255, 255, 255, 0.08)",
+    "border": "rgba(255, 255, 255, 0.10)",
     "border_focus": "#60A5FA",
     "text_primary": "#F8FAFC",
     "text_secondary": "#CBD5E1",
-    "text_muted": "#8492A6",
-    "accent": "#3B82F6",
-    "accent_hover": "#60A5FA",
-    "accent_light": "#172E52",
-    "success": "#22C55E",
+    "text_muted": "#A5B3C8",
+    "accent": "#60A5FA",
+    "accent_hover": "#93C5FD",
+    "accent_light": "rgba(96, 165, 250, 0.16)",
+    "primary_bg": "#2563EB",
+    "primary_hover": "#3B82F6",
+    "primary_pressed": "#1D4ED8",
+    "primary_gradient_start": "#2563EB",
+    "primary_gradient_end": "#4F46E5",
+    "primary_hover_start": "#2F64D6",
+    "primary_hover_end": "#5A4FD6",
+    "success": "#34D399",
     "success_bg": "#123522",
     "success_hover": "#16A34A",
     "danger": "#F87171",
-    "danger_bg": "#401C25",
-    "warning": "#F59E0B",
-    "input_bg": "#0D1728",
-    "input_border": "#30415A",
-    "sidebar_bg": "#0D1728",
-    "sidebar_selected": "#1D4ED8",
+    "danger_bg": "rgba(239, 68, 68, 0.14)",
+    "danger_border": "rgba(239, 68, 68, 0.35)",
+    "warning": "#FBBF24",
+    "input_bg": "rgba(10, 15, 26, 0.65)",
+    "popup_bg": "#131929",
+    "input_border": "rgba(255, 255, 255, 0.12)",
+    "sidebar_bg": "rgba(10, 15, 26, 0.75)",
+    "sidebar_selected": "#263A60",
     "tab_active": "#60A5FA",
     "tab_inactive": "#94A3B8",
-    "progress_bg": "#26364D",
-    "progress_fill": "#22C55E",
-    "log_bg": "#07101D",
-    "log_fg": "#D7E2F0",
-    "log_border": "#22324A",
-    "separator": "#22324A",
+    "progress_bg": "rgba(10, 15, 26, 0.70)",
+    "progress_fill": "#34D399",
+    "log_bg": "rgba(8, 12, 20, 0.88)",
+    "log_fg": "#E2E8F0",
+    "log_border": "rgba(255, 255, 255, 0.08)",
+    "separator": "rgba(255, 255, 255, 0.08)",
     "badge_blue": "#172E52",
     "badge_blue_text": "#93C5FD",
     "purple": "#A78BFA",
     "purple_hover": "#C4B5FD",
-    "title_bar": "#0D1728",
+    "title_bar": "rgba(11, 15, 25, 0.75)",
+    "footer_bg": "rgba(11, 15, 25, 0.85)",
+    "disabled_bg": "rgba(255, 255, 255, 0.03)",
+    "disabled_border": "rgba(255, 255, 255, 0.06)",
+    "disabled_text": "rgba(148, 163, 184, 0.45)",
 }
 
 if sys.platform == "darwin":
@@ -119,6 +141,87 @@ def resource_path(relative_path):
     """Resolve source assets and files bundled into a PyInstaller executable."""
     root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return root / relative_path
+
+
+@lru_cache(maxsize=128)
+def ui_icon(
+    name: str,
+    color=None,
+    disabled_color=None,
+    size: int = 40,
+) -> QIcon:
+    """Load local SVG icons with high-DPI and disabled-state support."""
+    if color is None:
+        color = COLORS["text_secondary"]
+    icon_path = resource_path(
+        "assets/uiverse/send.svg" if name == "send" else f"assets/lucide/{name}.svg"
+    )
+    if not icon_path.is_file():
+        return QIcon()
+
+    renderer = QSvgRenderer(str(icon_path))
+    icon = QIcon()
+
+    # 1. Normal state (rendered at 2x device pixel ratio for high DPI)
+    normal_pixmap = QPixmap(size, size)
+    normal_pixmap.fill(Qt.transparent)
+    painter = QPainter(normal_pixmap)
+    renderer.render(painter)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(normal_pixmap.rect(), QColor(color))
+    painter.end()
+    normal_pixmap.setDevicePixelRatio(2)
+    icon.addPixmap(normal_pixmap, QIcon.Mode.Normal)
+
+    # 2. Disabled state
+    disabled_pixmap = QPixmap(size, size)
+    disabled_pixmap.fill(Qt.transparent)
+    painter = QPainter(disabled_pixmap)
+    renderer.render(painter)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    d_color = (
+        QColor(disabled_color)
+        if disabled_color and not disabled_color.startswith("rgba")
+        else QColor(148, 163, 184, 115)
+    )
+    painter.fillRect(disabled_pixmap.rect(), d_color)
+    painter.end()
+    disabled_pixmap.setDevicePixelRatio(2)
+    icon.addPixmap(disabled_pixmap, QIcon.Mode.Disabled)
+
+    return icon
+
+
+def apply_ui_icons(root):
+    icons = {
+        "新增": "plus", "新建任务": "plus", "保存": "save",
+        "保存环境配置": "save", "删除": "trash-2", "移除": "trash-2",
+        "取消": "square", "停止": "square", "开始一键流程": "play",
+        "刷新": "refresh-cw", "刷新云端目标": "refresh-cw",
+        "刷新三个栏位": "refresh-cw", "配置迁移": "copy",
+        "登录并加载": "arrow-down-to-line", "自动登录": "arrow-down-to-line",
+        "执行环境部署": "send", "部署当前 Jenkins 包": "send",
+        "编辑": "pencil",
+    }
+    for button in root.findChildren(QPushButton) + root.findChildren(QToolButton):
+        if isinstance(button, QToolButton) and button.arrowType() != Qt.NoArrow:
+            continue
+        label = button.text().strip()
+        name = icons.get(label)
+        if not name and not label and "刷新" in button.toolTip():
+            name = "refresh-cw"
+        if not name:
+            continue
+        color = "#FFFFFF" if button.objectName() in ("PrimaryBtn", "SuccessBtn") else COLORS["text_secondary"]
+        if button.objectName() == "DangerGhostBtn":
+            color = COLORS["danger"]
+        button.setIcon(ui_icon(name, color))
+        button.setIconSize(QSize(16, 16))
+        button.setCursor(Qt.PointingHandCursor)
+        if isinstance(button, QToolButton) and label:
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        if not button.accessibleName():
+            button.setAccessibleName(label or button.toolTip())
 
 
 def platform_config_dir(app_name=APP_NAME):
@@ -597,6 +700,7 @@ class ConfigStore:
         with self._save_lock:
             exported_data = copy.deepcopy(self.data)
             exported_data.get("jenkins", {}).pop("job_cache", None)
+            exported_data.pop("selection_cache", None)
         package = {
             "format": CONFIG_EXPORT_FORMAT,
             "version": CONFIG_EXPORT_VERSION,
@@ -978,6 +1082,15 @@ class JenkinsClient:
 
         raise RuntimeError("Jenkins GET 重试流程异常结束")
 
+    def verify_authentication(self):
+        identity = self.get_json(self.url + "/whoAmI/api/json")
+        if not isinstance(identity, dict) or identity.get("authenticated") is not True:
+            raise RuntimeError("Jenkins 未确认登录身份，请检查账号和密码/API Token")
+        if identity.get("anonymous") is True or identity.get("name") == "anonymous":
+            raise RuntimeError("Jenkins 当前识别为匿名用户，请检查账号和密码/API Token")
+        if not identity.get("name"):
+            raise RuntimeError("Jenkins 未返回有效的登录身份，请检查服务器地址")
+
     @staticmethod
     def _raise_for_status(response):
         if response.ok:
@@ -995,10 +1108,40 @@ class JenkinsClient:
         detail = "；".join(detail_parts) or " ".join(text.split())
         if len(detail) > 800:
             detail = detail[:800] + "..."
-        message = f"Jenkins HTTP {response.status_code}: {response.request.method} {response.url}"
+        hints = {
+            401: "身份认证失败，请检查账号和密码/API Token",
+            403: "访问被拒绝，请检查账号权限或 Jenkins 访问策略",
+        }
+        hint = hints.get(response.status_code)
+        message = f"Jenkins HTTP {response.status_code}"
+        if hint:
+            message += f"：{hint}\n"
+        else:
+            message += ": "
+        message += f"{response.request.method} {response.url}"
         if detail:
             message += f"\n返回信息：{detail}"
         raise RuntimeError(message)
+
+    def get_build_summary(self, path, *, job_url="", build_url=""):
+        """Read one build's status and SCM changes without fetching parameters."""
+        if not build_url:
+            base = (job_url or jenkins_job_api_url(self.url, path)).rstrip("/")
+            last_build = self.get_json(
+                base + "/api/json", {"tree": "lastBuild[number,url]"}
+            ).get("lastBuild")
+            if not last_build:
+                return None
+            build_url = last_build.get("url") or f"{base}/{last_build['number']}/"
+        items = "items[commitId,id,msg,author[fullName]]"
+        data = self.get_json(build_url.rstrip("/") + "/api/json", {
+            "tree": "number,url,building,result,timestamp,duration,"
+                    "actions[causes[userName,shortDescription],"
+                    "lastBuiltRevision[SHA1,branch[name]]],"
+                    f"changeSet[{items}],changeSets[{items}]",
+        })
+        data.setdefault("url", build_url)
+        return data
 
     def list_jobs(self, path):
         url = jenkins_job_api_url(self.url, path) + "/api/json"
@@ -1007,8 +1150,8 @@ class JenkinsClient:
         )
         return data.get("jobs", [])
 
-    def get_parameters(self, path):
-        job_url = jenkins_job_api_url(self.url, path)
+    def get_parameters(self, path, *, job_url=""):
+        job_url = job_url.rstrip("/") or jenkins_job_api_url(self.url, path)
         url = job_url + "/api/json"
         tree = (
             "property[parameterDefinitions["
@@ -1020,7 +1163,7 @@ class JenkinsClient:
         for prop in data.get("property", []):
             for item in prop.get("parameterDefinitions", []):
                 if item.get("type") == "GitParameterDefinition":
-                    item["choices"] = self._get_git_parameter_choices(
+                    item["choices"] = self.get_git_parameter_choices(
                         job_url, item.get("name", "")
                     )
                 result.append(item)
@@ -1039,6 +1182,8 @@ class JenkinsClient:
         )
         data = self.get_json(url, {"param": name})
         return [item["value"] for item in data.get("values", []) if item.get("value")]
+
+    get_git_parameter_choices = _get_git_parameter_choices
 
     def _crumb_headers(self):
         try:
@@ -1073,14 +1218,20 @@ class JenkinsClient:
                         raise
                     if data.get("cancelled"):
                         return
+                    executable = data.get("executable")
+                    if executable and executable.get("url"):
+                        # The executor may claim the item while cancellation is in flight.
+                        location = executable["url"]
+                        break
                     time.sleep(1)
-                raise RuntimeError("已发送 Jenkins 队列取消请求，但未确认任务离开队列")
+                else:
+                    raise RuntimeError("已发送 Jenkins 队列取消请求，但未确认任务离开队列")
 
             build_url = location.rstrip("/")
             current = self.get_json(
                 build_url + "/api/json", {"tree": "building,result,number,url"}
             )
-            if not current.get("building"):
+            if current.get("building") is False:
                 return
             actions = (("stop", 8), ("term", 6), ("kill", 6))
             for action, checks in actions:
@@ -1091,7 +1242,7 @@ class JenkinsClient:
                     data = self.get_json(
                         build_url + "/api/json", {"tree": "building,result,number,url"}
                     )
-                    if not data.get("building"):
+                    if data.get("building") is False:
                         return
                     time.sleep(1)
             raise RuntimeError("Jenkins 已接收终止请求，但构建仍处于运行状态，请在 Jenkins 中检查")
@@ -1206,10 +1357,14 @@ class Worker(QThread):
 #  Global QSS Stylesheet
 # ══════════════════════════════════════════════════════════════════════
 GLOBAL_QSS = f"""
-QMainWindow, QWidget#CentralWidget,
-QWidget#JenkinsPage, QWidget#DeployPage, QWidget#CloudDeployPage,
-QWidget#JenkinsScrollContent, QWidget#CloudDeployScrollContent {{
+QMainWindow {{
     background-color: {COLORS['bg']};
+}}
+QWidget#CentralWidget,
+QWidget#JenkinsPage, QWidget#DeployPage, QWidget#CloudDeployPage,
+QWidget#JenkinsScrollContent, QWidget#CloudDeployScrollContent,
+QWidget#DeployScrollContent, QStackedWidget#TaskWorkspaceStack {{
+    background: transparent;
 }}
 
 QAbstractScrollArea, QAbstractScrollArea > QWidget,
@@ -1217,24 +1372,23 @@ QAbstractScrollArea > QWidget > QWidget {{
     background: transparent;
 }}
 
-QFrame#Card {{
-    background: {COLORS['card']};
-    border-radius: 12px;
-    border: 1px solid {COLORS['border']};
-}}
-
-QFrame#DarkCard {{
-    background: {COLORS['log_bg']};
-    border-radius: 12px;
-    border: 1px solid {COLORS['log_border']};
+QFrame#Card, QFrame#DarkCard {{
+    background: transparent;
+    border: none;
 }}
 
 QLabel {{
     color: {COLORS['text_primary']};
 }}
+QLabel#CardTitle {{
+    font-family: "{FONT_FAMILY}";
+    font-size: 14px;
+    font-weight: 600;
+    color: #F1F5F9;
+}}
 
 /* ── Inputs ────────────────────────────────────────────── */
-QLineEdit {{
+QLineEdit, QPlainTextEdit {{
     background: {COLORS['input_bg']};
     border: 1px solid {COLORS['input_border']};
     border-radius: 8px;
@@ -1243,11 +1397,16 @@ QLineEdit {{
     font-family: "{FONT_FAMILY}";
     color: {COLORS['text_primary']};
     selection-background-color: {COLORS['accent_light']};
-    selection-color: {COLORS['text_primary']};
+    selection-color: #FFFFFF;
 }}
-QLineEdit:focus {{
-    border: 2px solid {COLORS['border_focus']};
-    background: #101D31;
+QLineEdit:focus, QPlainTextEdit:focus {{
+    border: 1px solid {COLORS['border_focus']};
+    background: rgba(12, 18, 32, 0.85);
+}}
+QLineEdit:disabled, QPlainTextEdit:disabled {{
+    background: {COLORS['disabled_bg']};
+    border: 1px solid {COLORS['disabled_border']};
+    color: {COLORS['disabled_text']};
 }}
 
 /* ── ComboBox ──────────────────────────────────────────── */
@@ -1260,20 +1419,23 @@ QComboBox {{
     font-family: "{FONT_FAMILY}";
     color: {COLORS['text_primary']};
     min-height: 20px;
+    selection-background-color: {COLORS['accent_light']};
 }}
 QComboBox:focus, QComboBox:on {{
-    border: 2px solid {COLORS['border_focus']};
-    background: #101D31;
+    border: 1px solid {COLORS['border_focus']};
+    background: rgba(12, 18, 32, 0.85);
 }}
-QLineEdit:disabled, QComboBox:disabled {{
-    background: #182338;
-    color: {COLORS['text_muted']};
+QComboBox:disabled {{
+    background: {COLORS['disabled_bg']};
+    border: 1px solid {COLORS['disabled_border']};
+    color: {COLORS['disabled_text']};
 }}
 QComboBox::drop-down {{
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 36px;
     border: none;
+    background: transparent;
 }}
 QComboBox::down-arrow {{
     image: none;
@@ -1281,24 +1443,25 @@ QComboBox::down-arrow {{
     height: 0;
 }}
 QComboBox QAbstractItemView {{
-    background: {COLORS['card']};
+    background: {COLORS['popup_bg']};
     color: #FFFFFF;
-    border: 1px solid {COLORS['border']};
+    border: 1px solid rgba(255, 255, 255, 0.16);
     border-radius: 8px;
     padding: 4px;
     selection-background-color: {COLORS['accent_light']};
-    selection-color: {COLORS['text_primary']};
+    selection-color: #FFFFFF;
     outline: none;
 }}
 QComboBox QAbstractItemView::item {{
-    min-height: 34px;
+    min-height: 32px;
     padding: 4px 10px;
     color: #FFFFFF;
-    background: {COLORS['card']};
+    background: transparent;
+    border-radius: 6px;
 }}
 QComboBox QAbstractItemView::item:hover {{
     color: #FFFFFF;
-    background: {COLORS['card_hover']};
+    background: rgba(255, 255, 255, 0.08);
 }}
 QComboBox QAbstractItemView::item:selected {{
     color: #FFFFFF;
@@ -1309,129 +1472,144 @@ QComboBox QAbstractItemView::item:disabled {{
 }}
 
 /* ── Buttons ───────────────────────────────────────────── */
-QPushButton {{
+QPushButton, QToolButton#IconButton {{
     font-family: "{FONT_FAMILY}";
     font-size: 13px;
     border-radius: 8px;
-    padding: 8px 14px;
-    background-color: #17243A;
-    border: 1px solid {COLORS['border']};
-    border-style: solid;
+    padding: 7px 14px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.16);
     color: {COLORS['text_primary']};
     min-width: 52px;
     min-height: 28px;
 }}
-QPushButton#PrimaryBtn {{
-    background-color: #2563EB;
-    border: 1px solid #3B82F6;
-    border-style: solid;
+QPushButton:hover, QToolButton#IconButton:hover {{
+    background: rgba(255, 255, 255, 0.13);
+    border-color: rgba(255, 255, 255, 0.32);
     color: #FFFFFF;
-    font-weight: bold;
+}}
+QPushButton:pressed, QToolButton#IconButton:pressed {{
+    background: rgba(255, 255, 255, 0.19);
+    border-color: rgba(255, 255, 255, 0.42);
+    padding: 8px 14px 6px 14px;
+}}
+QPushButton:focus, QToolButton#IconButton:focus {{
+    border: 1px solid {COLORS['border_focus']};
+}}
+QPushButton:disabled, QToolButton#IconButton:disabled {{
+    background: {COLORS['disabled_bg']};
+    border: 1px solid {COLORS['disabled_border']};
+    color: {COLORS['disabled_text']};
+}}
+QPushButton#PrimaryBtn {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {COLORS['primary_gradient_start']}, stop:1 {COLORS['primary_gradient_end']});
+    border: 1px solid rgba(255, 255, 255, 0.30);
+    color: #FFFFFF;
+    font-weight: 600;
 }}
 QPushButton#PrimaryBtn:hover {{
-    background-color: #3B82F6;
-    border: 1px solid #60A5FA;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {COLORS['primary_hover_start']}, stop:1 {COLORS['primary_hover_end']});
+    border-color: rgba(255, 255, 255, 0.50);
+    color: #FFFFFF;
 }}
 QPushButton#PrimaryBtn:pressed {{
-    background-color: #1D4ED8;
-    border: 1px solid #1E40AF;
-}}
-QPushButton:disabled {{
-    background-color: #1A273A;
-    border: 1px solid #314157;
-    border-style: solid;
-    color: #64748B;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 {COLORS['primary_pressed']}, stop:1 #4338CA);
+    border-color: rgba(255, 255, 255, 0.25);
 }}
 QPushButton#PrimaryBtn:disabled {{
-    background-color: #1A273A;
-    color: #64748B;
-    border: 1px solid #314157;
-    border-style: solid;
-    font-weight: bold;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: {COLORS['disabled_text']};
+}}
+QPushButton#SuccessBtn {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #047857, stop:1 #0F766E);
+    border: 1px solid rgba(255, 255, 255, 0.30);
+    color: #FFFFFF;
+    font-weight: 600;
+}}
+QPushButton#SuccessBtn:hover {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #06775A, stop:1 #0E726C);
+    border-color: rgba(255, 255, 255, 0.50);
+    color: #FFFFFF;
+}}
+QPushButton#SuccessBtn:pressed {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #065F46, stop:1 #075E57);
+    border-color: rgba(255, 255, 255, 0.25);
+}}
+QPushButton#SuccessBtn:disabled, QPushButton#SuccessBtn:!enabled {{
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: {COLORS['disabled_text']};
 }}
 QPushButton#GhostBtn {{
-    background: #17243A;
-    border: 1px solid {COLORS['border']};
-    border-style: solid;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.14);
     color: {COLORS['text_primary']};
 }}
 QPushButton#GhostBtn:hover {{
-    background: {COLORS['accent_light']};
-    border: 1px solid {COLORS['accent']};
-    color: {COLORS['accent_hover']};
+    background: rgba(96, 165, 250, 0.16);
+    border-color: rgba(96, 165, 250, 0.45);
+    color: #93C5FD;
 }}
-QPushButton#DangerGhostBtn {{
-    background: #241827;
-    border: 1px solid {COLORS['danger']};
-    border-style: solid;
-    color: {COLORS['danger']};
+QPushButton#GhostBtn:pressed {{
+    background: rgba(96, 165, 250, 0.24);
 }}
-QPushButton#DangerGhostBtn:hover {{
+QPushButton#DangerBtn, QPushButton#DangerGhostBtn {{
     background: {COLORS['danger_bg']};
+    border: 1px solid {COLORS['danger_border']};
+    color: #FCA5A5;
+    border-radius: 8px;
 }}
-QPushButton#DangerGhostBtn:disabled, QPushButton#DangerGhostBtn:!enabled {{
-    background: #1A273A;
-    border: 1px solid #314157;
-    border-style: solid;
-    color: #64748B;
-}}
-QPushButton#SuccessBtn {{
-    background: {COLORS['success']};
-    border: 1px solid {COLORS['success_hover']};
-    border-style: solid;
+QPushButton#DangerBtn:hover, QPushButton#DangerGhostBtn:hover {{
+    background: rgba(239, 68, 68, 0.22);
+    border-color: rgba(239, 68, 68, 0.55);
     color: #FFFFFF;
-    font-weight: bold;
 }}
-QPushButton#SuccessBtn:hover {{
-    background: {COLORS['success_hover']};
-    border: 1px solid #047857;
+QPushButton#DangerBtn:pressed, QPushButton#DangerGhostBtn:pressed {{
+    background: rgba(239, 68, 68, 0.32);
 }}
-QPushButton:focus {{
-    border: 2px solid {COLORS['border_focus']};
-}}
-QPushButton#SuccessBtn:disabled, QPushButton#SuccessBtn:!enabled {{
-    background: #1A273A;
-    color: #64748B;
-    border: 1px solid #314157;
-    border-style: solid;
-    font-weight: bold;
+QPushButton#DangerBtn:disabled, QPushButton#DangerGhostBtn:disabled,
+QPushButton#DangerGhostBtn:!enabled {{
+    background: {COLORS['disabled_bg']};
+    border: 1px solid {COLORS['disabled_border']};
+    color: {COLORS['disabled_text']};
 }}
 
 /* ── Tab Widget ────────────────────────────────────────── */
 QTabWidget#MainTabs {{
-    /*
-     * macOS and some Linux Qt styles expose the QTabWidget base to the right
-     * of a non-expanding tab bar. Paint that base explicitly so the unused
-     * header area cannot fall back to the native light system palette.
-     */
-    background-color: {COLORS['title_bar']};
+    background: transparent;
     border: none;
 }}
 QTabWidget::pane {{
-    background: {COLORS['bg']};
+    background: transparent;
     border: none;
 }}
 QTabBar {{
-    background: {COLORS['title_bar']};
+    background: transparent;
 }}
 QTabBar::tab {{
-    background: {COLORS['title_bar']};
-    color: {COLORS['text_secondary']};
-    padding: 12px 24px;
-    font-size: 14px;
+    background: transparent;
+    color: {COLORS['text_muted']};
+    padding: 10px 22px;
+    font-size: 13px;
     font-family: "{FONT_FAMILY}";
-    font-weight: bold;
+    font-weight: 500;
     border: none;
-    border-bottom: 3px solid transparent;
+    border-bottom: 2px solid transparent;
     margin-right: 4px;
 }}
 QTabBar::tab:selected {{
-    color: {COLORS['accent']};
-    border-bottom: 3px solid {COLORS['accent']};
+    color: {COLORS['text_primary']};
+    font-weight: 600;
+    border-bottom: 2px solid {COLORS['accent']};
 }}
 QTabBar::tab:hover:!selected {{
-    color: {COLORS['text_primary']};
-    border-bottom: 3px solid {COLORS['border']};
+    color: #FFFFFF;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 6px 6px 0 0;
 }}
 
 /* ── Tree Widget ───────────────────────────────────────── */
@@ -1453,16 +1631,16 @@ QTreeWidget::item:selected {{
     color: #FFFFFF;
 }}
 QTreeWidget::item:hover:!selected {{
-    background: {COLORS['accent_light']};
+    background: rgba(255, 255, 255, 0.08);
 }}
 QHeaderView::section {{
-    background: {COLORS['sidebar_bg']};
+    background: rgba(10, 15, 26, 0.70);
     color: {COLORS['text_secondary']};
     font-size: 12px;
-    font-weight: bold;
+    font-weight: 600;
     padding: 6px 10px;
     border: none;
-    border-bottom: 1px solid {COLORS['border']};
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }}
 
 QSplitter::handle {{
@@ -1470,9 +1648,8 @@ QSplitter::handle {{
 }}
 
 QMessageBox, QDialog {{
-    background: {COLORS['bg']};
+    background: #0E1322;
 }}
-
 QMessageBox QLabel {{
     color: {COLORS['text_primary']};
     min-width: 280px;
@@ -1480,27 +1657,27 @@ QMessageBox QLabel {{
 
 /* ── Progress Bar ──────────────────────────────────────── */
 QProgressBar {{
-    background: {COLORS['progress_bg']};
-    border: none;
+    background: rgba(10, 15, 26, 0.70);
+    border: 1px solid rgba(255, 255, 255, 0.10);
     border-radius: 4px;
     max-height: 8px;
     text-align: center;
 }}
 QProgressBar::chunk {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {COLORS['accent']}, stop:1 {COLORS['success']});
-    border-radius: 4px;
+        stop:0 #2563EB, stop:1 #34D399);
+    border-radius: 3px;
 }}
 
 /* ── Log Text ──────────────────────────────────────────── */
 QPlainTextEdit#LogText {{
-    background: {COLORS['log_bg']};
+    background: transparent;
     color: {COLORS['log_fg']};
     border: none;
     font-family: "{FONT_MONO}";
     font-size: 11px;
-    padding: 12px 16px;
-    selection-background-color: #3F3F46;
+    padding: 8px 12px;
+    selection-background-color: {COLORS['accent_light']};
     selection-color: #FFFFFF;
 }}
 
@@ -1511,33 +1688,33 @@ QScrollBar:vertical {{
     margin: 0;
 }}
 QScrollBar::handle:vertical {{
-    background: {COLORS['border']};
+    background: rgba(255, 255, 255, 0.15);
     border-radius: 4px;
     min-height: 30px;
 }}
 QScrollBar::handle:vertical:hover {{
-    background: {COLORS['text_muted']};
+    background: rgba(255, 255, 255, 0.28);
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
 }}
-QScrollBar:horizontal {{
+QScrollBar::horizontal {{
     background: transparent;
     height: 8px;
 }}
 QScrollBar::handle:horizontal {{
-    background: {COLORS['border']};
+    background: rgba(255, 255, 255, 0.15);
     border-radius: 4px;
     min-width: 30px;
 }}
 QScrollBar::handle:horizontal:hover {{
-    background: {COLORS['text_muted']};
+    background: rgba(255, 255, 255, 0.28);
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0;
 }}
 
-/* ── CheckBox (used for booleans) ──────────────────────── */
+/* ── CheckBox ──────────────────────────────────────────── */
 QCheckBox {{
     font-family: "{FONT_FAMILY}";
     font-size: 13px;
@@ -1545,27 +1722,48 @@ QCheckBox {{
     spacing: 8px;
 }}
 QCheckBox::indicator {{
-    width: 20px;
-    height: 20px;
-    border-radius: 6px;
-    border: 2px solid {COLORS['border']};
-    background: {COLORS['input_bg']};
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 1px solid rgba(255, 255, 255, 0.20);
+    background: rgba(10, 15, 26, 0.70);
+}}
+QCheckBox::indicator:hover {{
+    border-color: {COLORS['accent']};
 }}
 QCheckBox::indicator:checked {{
-    background: {COLORS['success']};
-    border-color: {COLORS['success']};
-    image: none;
+    background: {COLORS['primary_bg']};
+    border-color: {COLORS['accent']};
+    image: url("{(resource_path('assets/lucide/check.svg')).as_posix()}");
 }}
 
 /* ── Tooltips ──────────────────────────────────────────── */
 QToolTip {{
-    background: #1E293B;
+    background: #182238;
     color: #F8FAFC;
-    border: 1px solid {COLORS['border']};
+    border: 1px solid rgba(255, 255, 255, 0.16);
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 12px;
     font-family: "{FONT_FAMILY}";
+}}
+
+/* ── Menus ─────────────────────────────────────────────── */
+QMenu {{
+    background: {COLORS['popup_bg']};
+    color: {COLORS['text_primary']};
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 8px;
+    padding: 4px;
+}}
+QMenu::item {{
+    color: {COLORS['text_primary']};
+    padding: 7px 18px;
+    border-radius: 4px;
+}}
+QMenu::item:selected {{
+    background: {COLORS['accent_light']};
+    color: #FFFFFF;
 }}
 """
 
@@ -1580,11 +1778,11 @@ def add_card_shadow(widget):
     return
 
 
-class CardWidget(QFrame):
-    """A white rounded card with drop shadow and optional title."""
+class CardWidget(GlassPanel):
+    """Frosted-glass rounded card with 16px radius, hover glow and optional title."""
 
     def __init__(self, title=None, parent=None):
-        super().__init__(parent)
+        super().__init__(parent=parent)
         self.setObjectName("Card")
         add_card_shadow(self)
 
@@ -1594,6 +1792,7 @@ class CardWidget(QFrame):
 
         if title:
             title_label = QLabel(title)
+            title_label.setObjectName("CardTitle")
             title_label.setStyleSheet(f"""
                 font-family: "{FONT_FAMILY}";
                 font-size: 14px;
@@ -1641,11 +1840,11 @@ class ToggleSwitch(QCheckBox):
         )
         checked = self.isChecked()
         enabled = self.isEnabled()
-        track_color = COLORS["success"] if checked else COLORS["input_bg"]
-        border_color = COLORS["success"] if checked else COLORS["border"]
+        track_color = COLORS["success"] if checked else "#162032"
+        border_color = COLORS["success"] if checked else "#30415A"
         if not enabled:
-            track_color = COLORS["progress_bg"]
-            border_color = COLORS["border"]
+            track_color = "#1D283A"
+            border_color = "#2A3A52"
 
         painter.setPen(QPen(QColor(border_color), 1.5))
         painter.setBrush(QBrush(QColor(track_color)))
@@ -1714,7 +1913,7 @@ class ErrorIcon(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(COLORS["danger_bg"]))
+        painter.setBrush(QColor(64, 28, 37))
         painter.drawEllipse(1, 1, 42, 42)
 
         pen = QPen(QColor(COLORS["danger"]), 3)
@@ -1894,6 +2093,8 @@ class InAppMessageOverlay(QWidget):
 class CollapsibleCardWidget(CardWidget):
     """Card with a compact header and content that can be expanded on demand."""
 
+    expanded_changed = Signal(bool)
+
     def __init__(self, title, expanded=False, parent=None):
         super().__init__(parent=parent)
         root_layout = super().content_layout()
@@ -1901,6 +2102,7 @@ class CollapsibleCardWidget(CardWidget):
         self._toggle = QToolButton(self)
         self._toggle.setText(title)
         self._toggle.setCheckable(True)
+        self._toggle.setAccessibleName(f"展开或收起{title}")
         self._toggle.setChecked(expanded)
         self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
@@ -1917,6 +2119,11 @@ class CollapsibleCardWidget(CardWidget):
             }}
             QToolButton:hover {{
                 color: {COLORS['accent_hover']};
+            }}
+            QToolButton:focus {{
+                color: {COLORS['accent_hover']};
+                border: 1px solid {COLORS['border_focus']};
+                border-radius: 4px;
             }}
         """)
         root_layout.addWidget(self._toggle)
@@ -1942,6 +2149,7 @@ class CollapsibleCardWidget(CardWidget):
         self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self._content.setVisible(expanded)
         self.updateGeometry()
+        self.expanded_changed.emit(expanded)
 
 
 class StatusBadge(QFrame):
@@ -2014,7 +2222,7 @@ class ComboArrowIndicator(QWidget):
 
 
 class ClearTreeBranchStyle(QProxyStyle):
-    """Draw large high-contrast expand/collapse controls for the job tree."""
+    """Draw frameless chevrons centered in each job-tree branch cell."""
 
     def drawPrimitive(self, element, option, painter, widget=None):
         if element != QStyle.PE_IndicatorBranch:
@@ -2024,32 +2232,27 @@ class ClearTreeBranchStyle(QProxyStyle):
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        center = option.rect.center()
-        indicator_rect = option.rect.adjusted(1, 1, -1, -1)
-        indicator_rect.setWidth(min(18, indicator_rect.width()))
-        indicator_rect.setHeight(min(18, indicator_rect.height()))
-        indicator_rect.moveCenter(center)
-
-        painter.setPen(QPen(QColor(COLORS['accent']), 1))
-        painter.setBrush(QColor(COLORS['badge_blue']))
-        painter.drawRoundedRect(indicator_rect, 5, 5)
-
-        painter.setPen(QPen(QColor(COLORS['accent_hover']), 2.2))
+        # Floating-point centers avoid the half-pixel bias of QRect.center()
+        # on even-sized rows, including when Windows scales the interface.
+        center = QRectF(option.rect).center()
+        color = COLORS['text_primary'] if option.state & QStyle.State_Selected else COLORS['text_secondary']
+        pen = QPen(QColor(color), 1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
         center_x = center.x()
         center_y = center.y()
+        path = QPainterPath()
         if option.state & QStyle.State_Open:
-            points = [
-                QPoint(center_x - 5, center_y - 2),
-                QPoint(center_x, center_y + 3),
-                QPoint(center_x + 5, center_y - 2),
-            ]
+            path.moveTo(center_x - 4, center_y - 2)
+            path.lineTo(center_x, center_y + 2)
+            path.lineTo(center_x + 4, center_y - 2)
         else:
-            points = [
-                QPoint(center_x - 2, center_y - 5),
-                QPoint(center_x + 3, center_y),
-                QPoint(center_x - 2, center_y + 5),
-            ]
-        painter.drawPolyline(QPolygon(points))
+            path.moveTo(center_x - 2, center_y - 4)
+            path.lineTo(center_x + 2, center_y)
+            path.lineTo(center_x - 2, center_y + 4)
+        painter.drawPath(path)
         painter.restore()
 
 
@@ -2075,20 +2278,23 @@ class SearchableComboBox(QComboBox):
         """Keep popup item text readable across native Windows Qt styles."""
         view = self.view()
         palette = view.palette()
-        palette.setColor(QPalette.Base, QColor(COLORS["card"]))
-        palette.setColor(QPalette.Window, QColor(COLORS["card"]))
+        popup_bg = COLORS.get("popup_bg", "#131929")
+        popup_border = COLORS.get("popup_border", "#2D3748")
+        sel_bg = COLORS.get("sidebar_selected", "#1D4ED8")
+        palette.setColor(QPalette.Base, QColor(popup_bg))
+        palette.setColor(QPalette.Window, QColor(popup_bg))
         palette.setColor(QPalette.Text, QColor("#FFFFFF"))
         palette.setColor(QPalette.WindowText, QColor("#FFFFFF"))
-        palette.setColor(QPalette.Highlight, QColor(COLORS["sidebar_selected"]))
+        palette.setColor(QPalette.Highlight, QColor(sel_bg))
         palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
         palette.setColor(QPalette.Disabled, QPalette.Text, QColor("#94A3B8"))
         view.setPalette(palette)
         view.setStyleSheet(f"""
             QAbstractItemView {{
-                background: {COLORS['card']};
+                background: {popup_bg};
                 color: #FFFFFF;
-                border: 1px solid {COLORS['border']};
-                selection-background-color: {COLORS['sidebar_selected']};
+                border: 1px solid {popup_border};
+                selection-background-color: {sel_bg};
                 selection-color: #FFFFFF;
                 outline: none;
             }}
@@ -2098,11 +2304,11 @@ class SearchableComboBox(QComboBox):
                 color: #FFFFFF;
             }}
             QAbstractItemView::item:hover {{
-                background: {COLORS['card_hover']};
+                background: #1E293B;
                 color: #FFFFFF;
             }}
             QAbstractItemView::item:selected {{
-                background: {COLORS['sidebar_selected']};
+                background: {sel_bg};
                 color: #FFFFFF;
             }}
         """)
@@ -2175,6 +2381,19 @@ class ClickExpandTreeWidget(QTreeWidget):
 # ══════════════════════════════════════════════════════════════════════
 #  Environment Dialog (PySide6)
 # ══════════════════════════════════════════════════════════════════════
+def _environment_validation_error(data, dashboard_valid):
+    if not all(data.get(key) for key in ("name", "host", "username")):
+        return "缺少信息", "环境名称、IP/主机和账号不能为空"
+    if not dashboard_valid:
+        return "Dashboard 无效", "请选择已保存的 Dashboard"
+    try:
+        if not 1 <= int(data.get("port", "")) <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        return "端口无效", "SSH 端口必须是 1-65535"
+    return None
+
+
 class EnvironmentDialog(QDialog):
     def __init__(self, parent, title, initial=None, dashboard_names=None):
         super().__init__(parent)
@@ -2260,6 +2479,7 @@ class EnvironmentDialog(QDialog):
         save_btn = QPushButton("保存")
         save_btn.setObjectName("PrimaryBtn")
         save_btn.setFixedSize(80, 36)
+        save_btn.setIcon(ui_icon("save"))
         save_btn.clicked.connect(self._save)
         btn_layout.addWidget(save_btn)
 
@@ -2273,18 +2493,9 @@ class EnvironmentDialog(QDialog):
 
     def _save(self):
         data = {key: self._get_value(key) for key in self.vars}
-        if not data["name"] or not data["host"] or not data["username"]:
-            QMessageBox.warning(self, "缺少信息", "环境名称、IP/主机和账号不能为空")
-            return
-        if not data["dashboard"]:
-            QMessageBox.warning(self, "未关联 Dashboard", "请选择右侧已保存的 Kubernetes Dashboard")
-            return
-        try:
-            port = int(data["port"])
-            if port < 1 or port > 65535:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, "端口无效", "SSH 端口必须是 1-65535")
+        error = _environment_validation_error(data, bool(data["dashboard"]))
+        if error:
+            QMessageBox.warning(self, *error)
             return
         data["password"] = protect_secret(data["password"])
         self.result = data
@@ -2396,8 +2607,9 @@ class TitleBar(QWidget):
         self._parent_window = parent_window
         self._drag_pos = None
         self.setFixedHeight(56)
+        self.setObjectName("TitleBar")
         self.setStyleSheet(f"""
-            QWidget {{
+            QWidget#TitleBar {{
                 background: {COLORS['title_bar']};
             }}
         """)
@@ -2496,14 +2708,24 @@ class TitleBar(QWidget):
         )
         self.config_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.config_button.setPopupMode(QToolButton.InstantPopup)
-        self.config_button.setFixedSize(112, 34)
+        self.config_button.setFixedSize(132, 34)
         self.config_button.setAccessibleName("导入或导出 Deploy Console 配置")
         self.config_button.setToolTip("导出或导入当前电脑的 Deploy Console 配置")
-        self.config_button.setStyleSheet(header_button_style)
+        self.config_button.setStyleSheet(header_button_style + f"""
+            QToolButton {{ padding: 0 24px 0 10px; }}
+            QToolButton::menu-indicator {{
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+                right: 7px;
+                width: 12px;
+                height: 12px;
+                image: url("{resource_path('assets/lucide/chevron-down.svg').as_posix()}");
+            }}
+        """)
         config_menu = QMenu(self.config_button)
         config_menu.setStyleSheet(f"""
             QMenu {{
-                background: {COLORS['input_bg']};
+                background: {COLORS['popup_bg']};
                 color: {COLORS['text_primary']};
                 border: 1px solid {COLORS['input_border']};
                 padding: 4px;
@@ -2523,6 +2745,14 @@ class TitleBar(QWidget):
         import_action = config_menu.addAction("导入配置...")
         import_action.setToolTip("导入配置包并覆盖当前全部配置")
         import_action.triggered.connect(parent_window.import_configuration)
+        config_menu.addSeparator()
+        exit_action = config_menu.addAction("退出应用")
+        exit_action.setToolTip("退出 Deploy Console（运行中的任务需要先结束）")
+        exit_handler = getattr(parent_window, "request_exit_application", None)
+        if exit_handler is not None:
+            exit_action.triggered.connect(exit_handler)
+        else:
+            exit_action.setEnabled(False)
         self.config_button.setMenu(config_menu)
         layout.addWidget(self.config_button, 0, Qt.AlignVCenter)
 
@@ -2568,7 +2798,7 @@ class DeployTool(QMainWindow):
     sig_error = Signal(str)
     sig_info = Signal(str)
     sig_jobs = Signal(object, object, object)  # parent_item, path, jobs
-    sig_params = Signal(object, object)  # path, params
+    sig_params = Signal(object, object)  # request, params
     sig_build_status = Signal(str)
     sig_build_progress = Signal(int)
     sig_build_finished = Signal()
@@ -2590,6 +2820,9 @@ class DeployTool(QMainWindow):
     sig_cloud_status_login_ok = Signal(str)
     sig_job_cache_loaded = Signal(int, object)
     sig_job_cache_error = Signal(int, str)
+    sig_branch_choices = Signal(object)
+    sig_branch_refresh_error = Signal(object)
+    sig_build_summary = Signal(object)
 
     def __init__(
         self, store=None, window_manager=None, task_number=1, embedded=False
@@ -2618,20 +2851,46 @@ class DeployTool(QMainWindow):
         self.current_job_url = ""
         self.current_display_path = []
         self.build_running = False
+        self._last_build_snapshot = None
+        self._active_build_client = None
         self.active_deploy_after_build = True
         self._job_filter_active = False
         self._job_filter_expanded_state = {}
         self._job_cache_generation = 0
+        self._job_cache_loading = False
         self.job_tree_cache = []
         self.param_vars = {}  # name → (widget, type)
+        self.param_refresh_buttons = {}
+        self._parameter_requests = {}
+        self._active_parameter_key = None
+        self._displayed_parameter_key = None
+        self._parameter_generation = 0
+        self._branch_refresh_generation = 0
+        self._branch_refresh_requests = {}
+        self._branch_refresh_active_tokens = set()
+        self._summary_selection = None
+        self._summary_request = None
+        self._summary_build_url = ""
+        self._summary_runs = {}
+        self._running_summary_selection = None
+        self._running_summary_build_url = ""
         self.dashboard_drivers = []
         self.cloud_driver = None
         self.ops_api = None
+        self._ops_api_identity = None
+        self._ops_login_lock = threading.Lock()
+        self._cloud_option_requests = {"build": 0, "tab": 0}
+        self._selected_module_path = []
         self.cloud_project_names = []
         self.cloud_options_loading = False
+        self._cloud_login_in_progress = False
         self.build_cloud_loading = False
         self.build_cloud_target_dirty = True
         self.remote_file_maps = {"image": {}, "yaml": {}}
+        self._env_var_values = {
+            key: DEFAULT_DEPLOY.get(key, "22" if key == "port" else "")
+            for _, key in ENVIRONMENT_FIELDS
+        }
         self.env_dirty = False
         self.loading_environment = False
         self.remote_loading = False
@@ -2659,6 +2918,8 @@ class DeployTool(QMainWindow):
 
         # ── Build UI ───────────────────────────────────────────────
         self._build_ui()
+        for field in (self.cloud_url, self.cloud_username, self.cloud_password):
+            field.textEdited.connect(self._invalidate_cloud_account)
         self.message_overlay = InAppMessageOverlay(self.centralWidget())
         self._new_task_shortcut = QShortcut(QKeySequence.New, self)
         self._new_task_shortcut.setContext(
@@ -2696,6 +2957,9 @@ class DeployTool(QMainWindow):
         self.sig_cloud_status_login_ok.connect(self._on_cloud_status_login_ok)
         self.sig_job_cache_loaded.connect(self._on_job_cache_loaded)
         self.sig_job_cache_error.connect(self._on_job_cache_error)
+        self.sig_branch_choices.connect(self._on_branch_choices)
+        self.sig_branch_refresh_error.connect(self._on_branch_refresh_error)
+        self.sig_build_summary.connect(self._on_build_summary)
 
     # ── Emit helpers (thread-safe via signals) ─────────────────────
     def emit(self, target, payload=None):
@@ -2740,6 +3004,10 @@ class DeployTool(QMainWindow):
             "job_cache_error": lambda: self.sig_job_cache_error.emit(
                 payload[0], payload[1]
             ),
+            "branch_choices": lambda: self.sig_branch_choices.emit(payload),
+            "branch_refresh_error": lambda: self.sig_branch_refresh_error.emit(
+                payload
+            ),
         }
         fn = sig_map.get(target)
         if fn:
@@ -2752,6 +3020,7 @@ class DeployTool(QMainWindow):
             manager.update_task(self)
 
     def _begin_tracked_task(self, kind, target, package="", title=""):
+        self._last_build_snapshot = None
         self._task_runtime_active = True
         self._task_state = "running"
         self._task_kind = kind
@@ -2812,10 +3081,28 @@ class DeployTool(QMainWindow):
             "progress": self._task_progress,
             "elapsed": elapsed,
             "can_cancel": self.build_running and not self.cancel_event.is_set(),
+            "is_cancelling": self.build_running and self.cancel_event.is_set(),
+            "restartable": self._task_state == "cancelled" and self._last_build_snapshot is not None,
+            "can_resume": self._can_resume_build(),
             "can_remove": not self.has_active_work(),
         }
 
+    def _can_resume_build(self):
+        return (
+            self._task_state == "cancelled"
+            and self._last_build_snapshot is not None
+            and not self.has_active_work()
+            and not self._workers
+        )
+
+    def resume_build(self):
+        if not self._can_resume_build():
+            return
+        self._launch_build(self._last_build_snapshot)
+
     def shutdown_resources(self):
+        self._summary_timer.stop()
+        self._summary_request = None
         if self.window_manager:
             self.window_manager.target_coordinator.release_all(self)
             self.window_manager.batch_coordinator.release_all(self)
@@ -2895,7 +3182,7 @@ class DeployTool(QMainWindow):
                 and self.build_deploy_mode.currentText() == "云端部署"
             ):
                 return
-        self.tab_widget.setCurrentIndex(1)
+        DeployTool._select_page(self, "DeployPage")
 
     @Slot(str)
     def _on_error(self, text):
@@ -2929,8 +3216,20 @@ class DeployTool(QMainWindow):
         self._insert_jobs(parent_item, path, jobs)
 
     @Slot(object, object)
-    def _on_params(self, path, params):
-        self._show_parameters(path, params)
+    def _on_params(self, request, params):
+        key = request["key"]
+        if self._parameter_requests.get(key) is not request:
+            return
+        self._parameter_requests.pop(key, None)
+        if request["client"] is not self.jenkins:
+            return
+        if params is None:
+            return
+        self._save_parameter_cache(key, params)
+        if key == self._active_parameter_key:
+            self._displayed_parameter_key = key
+            self._show_parameters(request["path"], params)
+            self._update_build_cloud_ready()
 
     @Slot(str)
     def _on_build_status(self, text):
@@ -2949,6 +3248,15 @@ class DeployTool(QMainWindow):
     @Slot()
     def _on_build_finished(self):
         self.build_running = False
+        if getattr(self, "_running_summary_selection", None):
+            self._summary_runs[self._running_summary_selection] = {
+                "build_url": self._running_summary_build_url, "finished": True,
+            }
+            if self._running_summary_selection == self._summary_selection:
+                self._summary_selection = None
+                self._select_build_summary()
+            self._running_summary_selection = None
+            self._running_summary_build_url = ""
         if hasattr(self, "deploy_after_build_checkbox"):
             self.deploy_after_build_checkbox.setEnabled(True)
         if hasattr(self, "build_deploy_mode"):
@@ -2968,7 +3276,7 @@ class DeployTool(QMainWindow):
 
     @Slot()
     def _on_select_deploy_tab(self):
-        self.tab_widget.setCurrentIndex(1)
+        DeployTool._select_page(self, "DeployPage")
 
     @Slot(object)
     def _on_remote_options(self, payload):
@@ -3009,7 +3317,7 @@ class DeployTool(QMainWindow):
             if sys.platform == "win32"
             else f"已自动登录：{name}"
         )
-        self.message_overlay.show_message("Dashboard", message)
+        self.deploy_log.appendPlainText(message)
 
     @Slot(str)
     def _on_loading_start(self, text):
@@ -3027,16 +3335,32 @@ class DeployTool(QMainWindow):
 
     @Slot(bool, str)
     def _on_jenkins_login_finished(self, success, message):
+        self._job_cache_loading = False
+        self.job_tree.setEnabled(success)
         self.login_button.setEnabled(True)
         self.login_button.setText("登录并加载")
         self.path_label.setText(f"  {message}")
+        self.path_label.setToolTip(message)
+        if not success:
+            self.build_button.setEnabled(False)
         if isinstance(self.jenkins_connection_card, CollapsibleCardWidget):
+            self.jenkins_connection_card._toggle.setText(
+                "Jenkins 连接 · 登录成功" if success else "Jenkins 连接 · 登录失败"
+            )
             self.jenkins_connection_card.set_expanded(not success)
 
     @Slot(str, str)
     def _on_pipeline_location(self, phase, url):
         self.pipeline_phase = phase
         self.pipeline_location = url
+        if phase == "jenkins" and self._running_summary_selection:
+            self._running_summary_build_url = url
+            self._summary_runs[self._running_summary_selection] = {
+                "build_url": url, "finished": False,
+            }
+            if self._running_summary_selection == self._summary_selection:
+                self._summary_selection = None
+                self._select_build_summary()
         self._notify_task_summary()
 
     @Slot(str)
@@ -3049,7 +3373,9 @@ class DeployTool(QMainWindow):
             elif text in ("部署失败", "部署结果未知"):
                 self._task_failed = True
             self._notify_task_summary()
-        self.cloud_login_button.setEnabled(True)
+        self.cloud_login_button.setEnabled(
+            not getattr(self, "_cloud_login_in_progress", False)
+        )
         if text == "已登录":
             self.cloud_deployment_card.show()
         elif text in (
@@ -3095,54 +3421,63 @@ class DeployTool(QMainWindow):
             self.cloud_status_login_button.setEnabled(True)
         if hasattr(self, "cloud_status_login_state"):
             self.cloud_status_login_state.setText("已登录")
-        QMessageBox.information(self, "云环境部署状态", f"已打开并登录：{name}")
+        self.cloud_log.appendPlainText(f"已打开并登录：{name}")
 
     @Slot(object)
     def _on_cloud_options(self, options):
         source = options.get("source", "tab")
+        request_source = "build" if source == "build" else "tab"
+        if (
+            options.get("request_id") is not None
+            and options["request_id"] != self._cloud_option_requests[request_source]
+        ):
+            return
+        if "cache_entries" in options:
+            for key, value in options["cache_entries"].items():
+                self._save_selection_cache("cloud_targets", key, value, save=False)
+            self._persist_selection_cache()
+        if options.get("error"):
+            if source == "build":
+                self._set_build_cloud_loading(False, "加载失败，可重试或刷新")
+            else:
+                self._set_cloud_target_loading(False, "加载失败，可重试或刷新")
+            self.message_overlay.show_message("云端目标加载失败", options["error"], kind="error")
+            return
+        if options.get("cache_warnings"):
+            self.message_overlay.show_message(
+                "云端缓存未全部完成", "\n".join(options["cache_warnings"][:5]), kind="error"
+            )
         projects = options.get("projects", [])
         deploy_types = options.get("types", [])
         regions = options.get("regions", [])
         if source == "build" and hasattr(self, "build_cloud_project"):
-            current_project = self.build_cloud_project.currentText()
-            current_type = self.build_cloud_type.currentText()
             current_region = self.build_cloud_region.currentText()
             self.build_cloud_project.set_values(projects)
             self.build_cloud_type.set_values(deploy_types)
             self.build_cloud_region.set_values(regions)
-            self.build_cloud_project.setCurrentText(
-                current_project or options.get("project", "")
-            )
-            selected_type = options.get("type", "")
-            if current_type in deploy_types:
-                selected_type = current_type
-            self.build_cloud_type.setCurrentText(selected_type)
+            self.build_cloud_project.setCurrentText(options.get("project", ""))
+            self.build_cloud_type.setCurrentText(options.get("type", ""))
             if current_region in regions:
                 self.build_cloud_region.setCurrentText(current_region)
+            elif current_region:
+                self.build_cloud_region.setCurrentIndex(-1)
             self._set_build_cloud_loading(False, "云端部署目标已就绪")
             self.build_cloud_target_dirty = False
             self._update_build_cloud_ready()
             return
 
-        current_project = self.cloud_project.currentText()
-        current_type = self.cloud_type.currentText()
         current_region = self.cloud_region.currentText()
+        self.cloud_deployment_card.show()
         self.cloud_project.set_values(projects)
         self.cloud_type.set_values(deploy_types)
         self.cloud_region.set_values(regions)
         package_source = source == "package"
-        selected_project = (
-            options.get("project", "")
-            if package_source
-            else current_project or options.get("project", "")
-        )
-        self.cloud_project.setCurrentText(selected_project)
-        selected_type = options.get("type", "")
-        if not package_source and current_type in deploy_types:
-            selected_type = current_type
-        self.cloud_type.setCurrentText(selected_type)
+        self.cloud_project.setCurrentText(options.get("project", ""))
+        self.cloud_type.setCurrentText(options.get("type", ""))
         if current_region in regions:
             self.cloud_region.setCurrentText(current_region)
+        elif current_region:
+            self.cloud_region.setCurrentIndex(-1)
         status = "已按包号匹配部署目标" if package_source else "部署数据已就绪"
         self._set_cloud_target_loading(False, status)
 
@@ -3176,6 +3511,7 @@ class DeployTool(QMainWindow):
             self._workers.remove(worker)
         except ValueError:
             pass
+        self._notify_task_summary()
 
     def request_new_task_window(self):
         """Add a task workspace to the shared task center."""
@@ -3189,6 +3525,20 @@ class DeployTool(QMainWindow):
             window.build_deploy_mode.setCurrentText("SSH 环境部署")
             window.build_env_combo.setCurrentText(self.build_env_combo.currentText())
             window.batch_status_label.setText("自动合批待命")
+
+    def request_exit_application(self):
+        """Request a real application exit from the title-bar menu."""
+        manager = getattr(self, "window_manager", None)
+        if manager is not None:
+            request_exit = getattr(manager, "request_exit", None)
+            if request_exit is not None:
+                request_exit()
+            else:
+                manager.close()
+            return
+        # Standalone/legacy windows do not have a manager close guard.
+        self._closing = True
+        self.close()
 
     def _configuration_windows(self):
         if self.window_manager is None:
@@ -3273,7 +3623,17 @@ class DeployTool(QMainWindow):
     def _reload_configuration_widgets(self):
         saved = self.store.data.get("jenkins", {})
         self.jenkins = None
+        self._job_cache_generation += 1
+        self._job_cache_loading = False
+        self.job_tree.setEnabled(True)
+        self._parameter_requests.clear()
+        self._active_parameter_key = None
+        self._displayed_parameter_key = None
         self.ops_api = None
+        self._ops_api_identity = None
+        for source in self._cloud_option_requests:
+            self._cloud_option_requests[source] += 1
+        self._selected_module_path = []
         self.cloud_project_names = []
         self.j_url.setText(saved.get("url", ""))
         self.j_user.setText(saved.get("username", ""))
@@ -3281,6 +3641,7 @@ class DeployTool(QMainWindow):
         self.current_job_path = []
         self.current_display_path = []
         self.current_job_url = ""
+        self._select_build_summary()
         self.job_tree_cache = []
         self.job_tree.clear()
         self.path_label.setText("  配置已导入，请重新登录 Jenkins")
@@ -3382,7 +3743,7 @@ class DeployTool(QMainWindow):
     #  BUILD UI
     # ══════════════════════════════════════════════════════════════
     def _build_ui(self):
-        central = QWidget()
+        central = GlassBackground()
         central.setObjectName("CentralWidget")
         self.setCentralWidget(central)
 
@@ -3403,10 +3764,12 @@ class DeployTool(QMainWindow):
         # ── Tab widget ─────────────────────────────────────────────
         self.tab_widget = QTabWidget()
         self.tab_widget.setObjectName("MainTabs")
+        self.tab_widget.setMovable(True)
         # Native document tabs on macOS/Linux may paint the unused tab-bar
         # area with the system light palette. Keep that native mode only on
         # Windows and let QSS own the complete portable-platform header.
         self.tab_widget.setDocumentMode(sys.platform == "win32")
+        self.tab_widget.tabBar().setDrawBase(False)
         root_layout.addWidget(self.tab_widget)
 
         # Tab 1: Jenkins 打包
@@ -3426,6 +3789,12 @@ class DeployTool(QMainWindow):
         cloud_page.setObjectName("CloudDeployPage")
         self.tab_widget.addTab(cloud_page, "  云端部署  ")
         self._build_cloud_deploy_tab(cloud_page)
+        for index, name in enumerate(("file-archive", "send", "cloud")):
+            self.tab_widget.setTabIcon(index, ui_icon(name))
+        self.tab_widget.setIconSize(QSize(18, 18))
+        self._apply_tab_order(self.store.data.get("tab_order", []))
+        self.tab_widget.tabBar().tabMoved.connect(self._save_tab_order)
+        apply_ui_icons(self)
         QTimer.singleShot(
             0, lambda: self._apply_build_deploy_mode(
                 self.build_deploy_mode.currentText(), prompt_for_account=False
@@ -3434,14 +3803,47 @@ class DeployTool(QMainWindow):
         if sys.platform == "win32":
             QTimer.singleShot(0, self._auto_login_jenkins)
 
+    def _select_page(self, name):
+        for index in range(self.tab_widget.count()):
+            page = self.tab_widget.widget(index)
+            if page.objectName() == name:
+                self.tab_widget.setCurrentWidget(page)
+                return
+
+    def _apply_tab_order(self, order):
+        if not isinstance(order, list):
+            return
+        names = [self.tab_widget.widget(i).objectName() for i in range(self.tab_widget.count())]
+        ordered = []
+        for name in order + names:
+            if name in names and name not in ordered:
+                ordered.append(name)
+        bar = self.tab_widget.tabBar()
+        current = self.tab_widget.currentWidget()
+        self._applying_tab_order = True
+        try:
+            for target, name in enumerate(ordered):
+                source = next(i for i in range(self.tab_widget.count())
+                              if self.tab_widget.widget(i).objectName() == name)
+                bar.moveTab(source, target)
+        finally:
+            self.tab_widget.setCurrentWidget(current)
+            self._applying_tab_order = False
+
+    def _save_tab_order(self, _from, _to):
+        if getattr(self, "_applying_tab_order", False):
+            return
+        order = [self.tab_widget.widget(i).objectName() for i in range(self.tab_widget.count())]
+        self.store.data["tab_order"] = order
+        self.store.save()
+        for window in self._configuration_windows():
+            if window is not self:
+                window._apply_tab_order(order)
+
     # ── Jenkins Tab ────────────────────────────────────────────────
     def _build_jenkins_tab(self, page):
         saved = self.store.data["jenkins"]
         saved_password = unprotect_secret(saved.get("password", ""))
-        auto_login_ready = all(
-            saved.get(key, "").strip()
-            for key in ("url", "username")
-        ) and bool(saved_password)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(10)
@@ -3449,7 +3851,7 @@ class DeployTool(QMainWindow):
         # ── Connection Card ────────────────────────────────────────
         if sys.platform == "win32":
             conn_card = CollapsibleCardWidget(
-                "Jenkins 连接", expanded=not auto_login_ready
+                "Jenkins 连接", expanded=True
             )
         else:
             conn_card = CardWidget("Jenkins 连接")
@@ -3534,13 +3936,13 @@ class DeployTool(QMainWindow):
             search_row.addWidget(self.job_filter_input, 1)
             self.job_cache_refresh_button = QToolButton()
             self.job_cache_refresh_button.setIcon(
-                self.style().standardIcon(QStyle.SP_BrowserReload)
+                ui_icon("refresh-cw")
             )
             self.job_cache_refresh_button.setIconSize(QSize(18, 18))
             self.job_cache_refresh_button.setFixedSize(34, 34)
             self.job_cache_refresh_button.setAccessibleName("重置 Jenkins 任务缓存")
             self.job_cache_refresh_button.setToolTip(
-                "重置并重新缓存 Jenkins 任务"
+                "刷新任务树；构建参数和分支在点击任务时读取并缓存"
             )
             self.job_cache_refresh_button.setStyleSheet(f"""
                 QToolButton {{
@@ -3569,12 +3971,17 @@ class DeployTool(QMainWindow):
             sidebar_card.content_layout().addLayout(search_row)
         sidebar_card.content_layout().addWidget(self.job_tree)
 
-        # Right: scrollable content area
+        # Keep the selected job and build controls visible above the scroll area.
+        right_column = QWidget()
+        column_layout = QVBoxLayout(right_column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(10)
+        work_splitter.addWidget(right_column)
         right_scroll = QScrollArea()
+        self.jenkins_scroll = right_scroll
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.NoFrame)
-        right_scroll.setStyleSheet(f"QScrollArea {{ background: {COLORS['bg']}; border: none; }}")
-        work_splitter.addWidget(right_scroll)
+        right_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
 
         right_widget = QWidget()
         right_widget.setObjectName("JenkinsScrollContent")
@@ -3597,15 +4004,25 @@ class DeployTool(QMainWindow):
             color: {COLORS['text_secondary']};
         """)
         self.path_label.setFixedHeight(36)
-        right_layout.addWidget(self.path_label)
+        column_layout.addWidget(self.path_label)
 
         # ── Action Bar Card ────────────────────────────────────────
         action_card = CardWidget()
-        right_layout.addWidget(action_card)
+        self.build_action_card = action_card
+        column_layout.addWidget(action_card)
+        column_layout.addWidget(right_scroll, 1)
 
+        toolbar = WrappingActionLayout()
+        action_card.content_layout().addLayout(toolbar)
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
-        action_card.content_layout().addLayout(action_row)
+        toolbar.addLayout(action_row)
+        target_row = QHBoxLayout()
+        target_row.setSpacing(8)
+        toolbar.addLayout(target_row)
+        environment_row = QHBoxLayout()
+        environment_row.setSpacing(8)
+        toolbar.addLayout(environment_row)
 
         # Windows 版支持关闭后续部署。默认开启，保持升级前的一键流程行为。
         if sys.platform == "win32":
@@ -3620,14 +4037,15 @@ class DeployTool(QMainWindow):
 
         self.build_button = QPushButton("开始一键流程")
         self.build_button.setObjectName("SuccessBtn")
-        self.build_button.setFixedHeight(40)
+        self.build_button.setFixedHeight(44)
         self.build_button.setMinimumWidth(170)
+        self.build_button.setStyleSheet("QPushButton { min-width: 196px; }")
         self.build_button.clicked.connect(self.start_build)
         action_row.addWidget(self.build_button)
 
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setObjectName("DangerGhostBtn")
-        self.cancel_button.setFixedSize(70, 40)
+        self.cancel_button.setFixedSize(82, 44)
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_pipeline)
         action_row.addWidget(self.cancel_button)
@@ -3638,7 +4056,7 @@ class DeployTool(QMainWindow):
             font-family: "{FONT_FAMILY}"; font-size: 12px;
             color: {COLORS['text_secondary']}; background: transparent;
         """)
-        action_row.addWidget(mode_lbl)
+        target_row.addWidget(mode_lbl)
 
         self.build_deploy_mode = SearchableComboBox(editable=False)
         self.build_deploy_mode.set_values(["SSH 环境部署", "云端部署"])
@@ -3647,44 +4065,42 @@ class DeployTool(QMainWindow):
         if saved_mode not in self.build_deploy_mode.values():
             saved_mode = "SSH 环境部署"
         self.build_deploy_mode.setCurrentText(saved_mode)
-        action_row.addWidget(self.build_deploy_mode)
+        target_row.addWidget(self.build_deploy_mode)
 
         self.build_env_label = QLabel("目标环境")
         self.build_env_label.setStyleSheet(f"""
             font-family: "{FONT_FAMILY}"; font-size: 12px;
             color: {COLORS['text_secondary']}; background: transparent;
         """)
-        action_row.addWidget(self.build_env_label)
+        environment_row.addWidget(self.build_env_label)
 
         self.build_env_combo = SearchableComboBox(editable=False)
         self.build_env_combo.setFixedWidth(160)
         self.build_env_combo.currentTextChanged.connect(self.load_environment)
-        action_row.addWidget(self.build_env_combo)
+        environment_row.addWidget(self.build_env_combo)
 
         # Status badge
         self.build_status_badge = StatusBadge("就绪", "success")
-        action_row.addWidget(self.build_status_badge)
-
-        action_row.addStretch()
+        self.build_status_badge.setFixedHeight(28)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        toolbar.addLayout(status_row)
+        status_row.addWidget(self.build_status_badge)
 
         # Progress bar
         self.build_progress = QProgressBar()
-        self.build_progress.setFixedSize(200, 8)
+        self.build_progress.setFixedSize(100, 8)
         self.build_progress.setRange(0, 100)
         self.build_progress.setValue(0)
         self.build_progress.setTextVisible(False)
-        action_row.addWidget(self.build_progress)
 
-        batch_status_row = QHBoxLayout()
-        batch_status_row.setSpacing(8)
-        action_card.content_layout().addLayout(batch_status_row)
+        status_row.addWidget(self.build_progress)
         self.batch_status_label = QLabel("自动合批待命")
         self.batch_status_label.setStyleSheet(
             f"color: {COLORS['text_secondary']}; background: transparent; font-size: 12px;"
         )
         self.batch_status_label.setAccessibleName("SSH 自动合批状态")
-        batch_status_row.addWidget(self.batch_status_label)
-        batch_status_row.addStretch()
+        action_card.content_layout().addWidget(self.batch_status_label)
 
         # ── Target Environment Config Card ─────────────────────────
         self.build_env_card = CollapsibleCardWidget("目标环境配置", expanded=False)
@@ -3732,7 +4148,7 @@ class DeployTool(QMainWindow):
         self.build_env_card.content_layout().addLayout(env_actions)
 
         # 云端部署模式专用的目标配置区，SSH 模式下保持隐藏。
-        self.build_cloud_card = CardWidget("云端部署目标配置")
+        self.build_cloud_card = CollapsibleCardWidget("云端部署目标配置", expanded=True)
         right_layout.addWidget(self.build_cloud_card)
         cloud_grid = QGridLayout()
         cloud_grid.setHorizontalSpacing(10)
@@ -3762,24 +4178,28 @@ class DeployTool(QMainWindow):
         cloud_grid.setColumnStretch(1, 1)
 
         cloud_loading_row = QHBoxLayout()
+        cloud_loading_row.setSpacing(12)
         self.build_cloud_loading_label = QLabel("")
         self.build_cloud_loading_label.setStyleSheet(
             f'color: {COLORS["text_secondary"]}; background: transparent;'
         )
-        cloud_loading_row.addWidget(self.build_cloud_loading_label)
+        cloud_loading_row.addWidget(self.build_cloud_loading_label, 0, Qt.AlignVCenter)
         self.build_cloud_progress = QProgressBar()
         self.build_cloud_progress.setRange(0, 0)
         self.build_cloud_progress.setTextVisible(False)
         self.build_cloud_progress.setFixedHeight(6)
         self.build_cloud_progress.hide()
         cloud_loading_row.addWidget(self.build_cloud_progress, 1)
+        cloud_loading_row.addStretch()
         cloud_grid.addLayout(cloud_loading_row, 3, 1)
 
         self.build_cloud_refresh_button = QPushButton("刷新云端目标")
         self.build_cloud_refresh_button.setObjectName("GhostBtn")
-        self.build_cloud_refresh_button.setFixedHeight(34)
-        self.build_cloud_refresh_button.clicked.connect(self.refresh_build_cloud_options)
-        cloud_grid.addWidget(self.build_cloud_refresh_button, 4, 1, Qt.AlignLeft)
+        self.build_cloud_refresh_button.setFixedHeight(44)
+        self.build_cloud_refresh_button.clicked.connect(
+            lambda: self.refresh_build_cloud_options(force=True)
+        )
+        cloud_loading_row.addWidget(self.build_cloud_refresh_button, 0, Qt.AlignVCenter)
 
         self.build_cloud_project.activated.connect(
             lambda *_: self.refresh_build_cloud_options()
@@ -3793,6 +4213,7 @@ class DeployTool(QMainWindow):
         self.build_cloud_type.activated.connect(
             lambda *_: self.refresh_build_cloud_options()
         )
+        self.build_cloud_region.activated.connect(lambda *_: self._update_build_cloud_ready())
         self.build_deploy_mode.currentTextChanged.connect(
             self._on_build_deploy_mode_changed
         )
@@ -3803,15 +4224,25 @@ class DeployTool(QMainWindow):
         self.build_cloud_card.hide()
 
         # ── Build Parameters Card ──────────────────────────────────
-        params_card = CardWidget("构建参数")
-        right_layout.addWidget(params_card, 1)
+        self.params_card = CollapsibleCardWidget("构建参数", expanded=False)
+        right_layout.addWidget(self.params_card)
+        self.params_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self.branch_summary = QWidget()
+        self.branch_summary_layout = QGridLayout(self.branch_summary)
+        self.branch_summary_layout.setContentsMargins(0, 0, 0, 0)
+        self.branch_summary_layout.setSpacing(6)
+        self.branch_summary_layout.setColumnStretch(1, 1)
+        self.params_card._layout.insertWidget(1, self.branch_summary)
+        self.branch_summary.hide()
+        self._branch_summary_rows = []
+        self.params_card.expanded_changed.connect(self._set_parameters_expanded)
 
         self.params_scroll_area = QScrollArea()
         self.params_scroll_area.setWidgetResizable(True)
         self.params_scroll_area.setFrameShape(QFrame.NoFrame)
         self.params_scroll_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         self.params_scroll_area.setMinimumHeight(180)
-        params_card.content_layout().addWidget(self.params_scroll_area)
+        self.params_card.content_layout().addWidget(self.params_scroll_area)
 
         self.params_container = QWidget()
         self.params_container.setObjectName("ParamsContainer")
@@ -3820,6 +4251,50 @@ class DeployTool(QMainWindow):
         self.params_layout.setSpacing(6)
         self.params_layout.setColumnStretch(1, 1)
         self.params_scroll_area.setWidget(self.params_container)
+
+        self.build_summary_card = CollapsibleCardWidget("状态集", expanded=True)
+        self.build_summary_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        right_layout.addWidget(self.build_summary_card)
+        summary_layout = self.build_summary_card.content_layout()
+        summary_row = QHBoxLayout()
+        self.build_summary_label = QLabel("请选择 Jenkins 构建任务")
+        self.build_summary_label.setTextFormat(Qt.PlainText)
+        self.build_summary_label.setWordWrap(True)
+        self.build_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        summary_row.addWidget(self.build_summary_label, 1)
+        self.build_summary_open_button = QPushButton("在 Jenkins 查看")
+        self.build_summary_open_button.setObjectName("GhostBtn")
+        self.build_summary_open_button.setEnabled(False)
+        self.build_summary_open_button.clicked.connect(self._open_build_summary)
+        summary_row.addWidget(self.build_summary_open_button)
+        self.build_summary_refresh_button = QPushButton("刷新状态集")
+        self.build_summary_refresh_button.setObjectName("GhostBtn")
+        self.build_summary_refresh_button.setEnabled(False)
+        self.build_summary_refresh_button.clicked.connect(
+            lambda: self._refresh_build_summary()
+        )
+        summary_row.addWidget(self.build_summary_refresh_button)
+        summary_layout.addLayout(summary_row)
+        self.build_summary_scm = QLabel()
+        self.build_summary_scm.setTextFormat(Qt.PlainText)
+        self.build_summary_scm.setWordWrap(True)
+        self.build_summary_scm.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.build_summary_scm.hide()
+        summary_layout.addWidget(self.build_summary_scm)
+        self.build_changes_title = QLabel("Changes · 提交变更")
+        summary_layout.addWidget(self.build_changes_title)
+        self.build_changes = QPlainTextEdit()
+        self.build_changes.setReadOnly(True)
+        self.build_changes.setAccessibleName("Jenkins 提交变更记录")
+        self.build_changes.setPlaceholderText("打包后显示本次构建的提交变更")
+        self.build_changes.setFixedHeight(114)
+        summary_layout.addWidget(self.build_changes)
+        self.build_changes_title.hide()
+        self.build_changes.hide()
+        self._summary_timer = QTimer(self)
+        self._summary_timer.setSingleShot(True)
+        self._summary_timer.setInterval(5000)
+        self._summary_timer.timeout.connect(self._refresh_build_summary)
 
         # ── Build Log ──────────────────────────────────────────────
         log_card = CardWidget("构建日志")
@@ -3845,9 +4320,20 @@ class DeployTool(QMainWindow):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
-        # Left column
-        left_col = QVBoxLayout()
+        # Keep form rows at their natural height when the task center expands.
+        self.deploy_scroll = QScrollArea()
+        self.deploy_scroll.setWidgetResizable(True)
+        self.deploy_scroll.setFrameShape(QFrame.NoFrame)
+        self.deploy_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
+        deploy_content = QWidget()
+        deploy_content.setObjectName("DeployScrollContent")
+        self.deploy_scroll.setWidget(deploy_content)
+        left_col = QVBoxLayout(deploy_content)
+        left_col.setContentsMargins(0, 0, 0, 0)
         left_col.setSpacing(12)
+        left_col.setSizeConstraint(QLayout.SetMinimumSize)
 
         # Package card
         pkg_card = CardWidget("包号")
@@ -3888,11 +4374,13 @@ class DeployTool(QMainWindow):
             font-family: "{FONT_FAMILY}"; font-size: 13px;
             color: {COLORS['text_secondary']}; background: transparent;
         """)
-        env_selector.addWidget(env_lbl)
+        env_selector.addWidget(env_lbl, 0, Qt.AlignVCenter)
 
         self.env_combo = SearchableComboBox(editable=False)
+        self.env_combo.setFixedHeight(44)
+        self.env_combo.setStyleSheet("QComboBox { min-height: 28px; max-height: 28px; }")
         self.env_combo.currentTextChanged.connect(self.load_environment)
-        env_selector.addWidget(self.env_combo, 1)
+        env_selector.addWidget(self.env_combo, 1, Qt.AlignVCenter)
 
         # Env buttons
         for text, cmd in [
@@ -3904,9 +4392,9 @@ class DeployTool(QMainWindow):
             is_danger = text == "删除"
             btn = QPushButton(text)
             btn.setObjectName("DangerGhostBtn" if is_danger else "GhostBtn")
-            btn.setFixedSize(72, 32)
+            btn.setFixedSize(82, 44)
             btn.clicked.connect(cmd)
-            env_selector.addWidget(btn)
+            env_selector.addWidget(btn, 0, Qt.AlignVCenter)
 
         env_card.content_layout().addLayout(env_selector)
 
@@ -3986,7 +4474,7 @@ class DeployTool(QMainWindow):
         self.deploy_log.setMinimumHeight(100)
         deploy_log_card.content_layout().addWidget(self.deploy_log)
 
-        layout.addLayout(left_col, 1)
+        layout.addWidget(self.deploy_scroll, 1)
 
         # Right column: Dashboard
         right_widget = QWidget()
@@ -4054,7 +4542,7 @@ class DeployTool(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet(
-            f"QScrollArea {{ background: {COLORS['bg']}; border: none; }}"
+            "QScrollArea { background: transparent; border: none; }"
         )
         page_layout.addWidget(scroll)
         self.cloud_deploy_scroll = scroll
@@ -4104,18 +4592,22 @@ class DeployTool(QMainWindow):
         connection_grid.setColumnStretch(1, 1)
 
         connection_actions = QHBoxLayout()
+        connection_actions.setSpacing(12)
         self.cloud_login_button = QPushButton("登录并加载部署数据")
         self.cloud_login_button.setObjectName("PrimaryBtn")
-        self.cloud_login_button.setFixedHeight(36)
-        self.cloud_login_button.clicked.connect(self.login_cloud_platform)
-        connection_actions.addWidget(self.cloud_login_button)
+        self.cloud_login_button.setFixedHeight(44)
+        self.cloud_login_button.setToolTip("加载部署数据，并打开浏览器自动登录 Ops 平台")
+        self.cloud_login_button.clicked.connect(
+            lambda: self.login_cloud_platform(open_browser=True)
+        )
 
         self.cloud_status_label = QLabel("未登录")
         self.cloud_status_label.setStyleSheet(
             f'color: {COLORS["text_secondary"]}; background: transparent;'
         )
-        connection_actions.addWidget(self.cloud_status_label)
+        connection_actions.addWidget(self.cloud_status_label, 0, Qt.AlignVCenter)
         connection_actions.addStretch()
+        connection_actions.addWidget(self.cloud_login_button, 0, Qt.AlignVCenter)
         connection_grid.addLayout(connection_actions, 3, 1)
 
         status_card = CardWidget("云环境部署状态（Rancher）")
@@ -4156,21 +4648,22 @@ class DeployTool(QMainWindow):
         status_grid.setColumnStretch(1, 1)
 
         status_actions = QHBoxLayout()
+        status_actions.setSpacing(12)
         self.cloud_status_login_button = QPushButton("保存并测试登录")
         self.cloud_status_login_button.setObjectName("PrimaryBtn")
-        self.cloud_status_login_button.setFixedHeight(36)
+        self.cloud_status_login_button.setFixedHeight(44)
         self.cloud_status_login_button.clicked.connect(self.login_cloud_status_page)
-        status_actions.addWidget(self.cloud_status_login_button)
         self.cloud_status_login_state = QLabel("部署成功后自动打开")
         self.cloud_status_login_state.setStyleSheet(
             f'color: {COLORS["text_secondary"]}; background: transparent;'
         )
-        status_actions.addWidget(self.cloud_status_login_state)
+        status_actions.addWidget(self.cloud_status_login_state, 0, Qt.AlignVCenter)
         status_actions.addStretch()
+        status_actions.addWidget(self.cloud_status_login_button, 0, Qt.AlignVCenter)
         status_grid.addLayout(status_actions, 3, 1)
 
         self.cloud_deployment_card = CardWidget("选择云端部署目标")
-        self.cloud_deployment_card.setMinimumHeight(252)
+        self.cloud_deployment_card.setMinimumHeight(300)
         self.cloud_deployment_card.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Fixed
         )
@@ -4196,6 +4689,11 @@ class DeployTool(QMainWindow):
         deploy_grid.setVerticalSpacing(8)
         self.cloud_deployment_card.content_layout().addLayout(deploy_grid)
 
+        self.cloud_package = QLineEdit(self.store.data.get("last_package", ""))
+        self.cloud_package.setPlaceholderText("默认带出 Jenkins 包号，可修改；按 Enter 匹配部署目标")
+        self.cloud_package.setAccessibleName("云端部署包号")
+        self.cloud_package.setToolTip("部署时以此处输入的包号为准")
+        self.cloud_package.returnPressed.connect(self.apply_cloud_target_from_package)
         self.cloud_project = SearchableComboBox(editable=True)
         self.cloud_project.setPlaceholderText("选择或输入部署专案")
         self.cloud_project.setCurrentText(saved.get("project", ""))
@@ -4213,6 +4711,7 @@ class DeployTool(QMainWindow):
         self.cloud_type.activated.connect(lambda *_: self.refresh_cloud_options())
 
         for row, (label, widget) in enumerate([
+            ("包号", self.cloud_package),
             ("部署专案", self.cloud_project),
             ("服务类型", self.cloud_type),
             ("云区节点", self.cloud_region),
@@ -4222,19 +4721,20 @@ class DeployTool(QMainWindow):
         deploy_grid.setColumnStretch(1, 1)
 
         deploy_actions = QHBoxLayout()
+        deploy_actions.setSpacing(8)
+        deploy_actions.addStretch()
         self.cloud_refresh_button = QPushButton("刷新三个栏位")
         self.cloud_refresh_button.setObjectName("GhostBtn")
-        self.cloud_refresh_button.setFixedHeight(36)
-        self.cloud_refresh_button.clicked.connect(self.refresh_cloud_options)
-        deploy_actions.addWidget(self.cloud_refresh_button)
+        self.cloud_refresh_button.setFixedHeight(44)
+        self.cloud_refresh_button.clicked.connect(lambda: self.refresh_cloud_options(force=True))
+        deploy_actions.addWidget(self.cloud_refresh_button, 0, Qt.AlignVCenter)
 
-        self.cloud_deploy_button = QPushButton("部署当前 Jenkins 包")
+        self.cloud_deploy_button = QPushButton("部署此包号")
         self.cloud_deploy_button.setObjectName("SuccessBtn")
-        self.cloud_deploy_button.setFixedHeight(36)
+        self.cloud_deploy_button.setFixedHeight(44)
         self.cloud_deploy_button.clicked.connect(self.start_cloud_deploy)
-        deploy_actions.addWidget(self.cloud_deploy_button)
-        deploy_actions.addStretch()
-        deploy_grid.addLayout(deploy_actions, 3, 1)
+        deploy_actions.addWidget(self.cloud_deploy_button, 0, Qt.AlignVCenter)
+        deploy_grid.addLayout(deploy_actions, 4, 1)
         self.cloud_deployment_card.hide()
 
         log_card = CardWidget("云端部署日志")
@@ -4256,13 +4756,6 @@ class DeployTool(QMainWindow):
     # ── Helper: Create environment fields ──────────────────────────
     def _create_environment_fields(self, grid, entries, start_row=0, columns=1):
         searchable = {"image_dir", "image_file", "yaml_dir", "yaml_file", "dashboard"}
-
-        # Create env_vars dict if not exists
-        if not hasattr(self, '_env_vars_inited'):
-            self._env_vars_inited = True
-            self._env_var_values = {}
-            for _, key in ENVIRONMENT_FIELDS:
-                self._env_var_values[key] = DEFAULT_DEPLOY.get(key, "22" if key == "port" else "")
 
         for index, (label, key) in enumerate(ENVIRONMENT_FIELDS):
             block = index % columns
@@ -4340,6 +4833,8 @@ class DeployTool(QMainWindow):
         if not url:
             QMessageBox.warning(self, "缺少信息", "请输入 Jenkins 地址")
             return
+        if isinstance(self.jenkins_connection_card, CollapsibleCardWidget):
+            self.jenkins_connection_card.set_expanded(True)
         try:
             self.store.data["jenkins"].update({
                 "url": url,
@@ -4353,6 +4848,9 @@ class DeployTool(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Jenkins 登录失败", f"初始化 Jenkins 连接失败：{exc}")
             return
+        self.current_job_path = []
+        self.current_job_url = ""
+        self._select_build_summary()
         if hasattr(self, "job_search_timer"):
             self.job_search_timer.stop()
         if hasattr(self, "job_filter_input"):
@@ -4368,46 +4866,41 @@ class DeployTool(QMainWindow):
         self.job_tree_cache = []
         self.job_tree.clear()
         self.login_button.setEnabled(False)
-        self.login_button.setText("正在加载...")
-        self.path_label.setText("  正在连接 Jenkins...")
+        self.login_button.setText("正在验证...")
+        self.path_label.setText("  正在验证 Jenkins 登录身份...")
+        self.path_label.setToolTip("")
+        if isinstance(self.jenkins_connection_card, CollapsibleCardWidget):
+            self.jenkins_connection_card._toggle.setText("Jenkins 连接 · 正在验证")
         if sys.platform == "win32":
-            generation = self._job_cache_generation
-            cached_jobs = self._load_saved_job_cache()
-            if cached_jobs is not None:
-                self.job_tree_cache = cached_jobs
-                self.job_filter_input.setEnabled(True)
-                self.job_cache_refresh_button.setEnabled(True)
-                self._render_job_cache(cached_jobs)
-                count = self._count_job_cache_nodes(cached_jobs)
-                self.emit(
-                    "jenkins_login_finished",
-                    (True, f"已加载 Jenkins 本地缓存，共 {count} 个任务"),
-                )
-                return
-            self.emit("loading_start", "正在登录并缓存 Jenkins 任务...")
-            self.run_thread(lambda: self._load_job_cache(generation))
+            self._start_job_cache_load(cached_jobs=self._load_saved_job_cache())
         else:
-            self.emit("loading_start", "正在加载 Jenkins...")
+            self._job_cache_loading = True
+            self.job_tree.setEnabled(False)
+            self.build_button.setEnabled(False)
+            self.emit("loading_start", "正在验证 Jenkins 登录身份...")
             self.run_thread(self._load_root_jobs)
 
     def _load_root_jobs(self):
         try:
+            self.jenkins.verify_authentication()
             jobs = self.jenkins.list_jobs([])
             self.emit("jobs", (None, [], jobs))
             self.emit(
                 "jenkins_login_finished",
-                (True, f"Jenkins 已连接，已加载 {len(jobs)} 个根任务"),
+                (True, f"Jenkins 登录成功，已加载 {len(jobs)} 个根任务"),
             )
         except Exception as exc:
-            self.emit("error", f"Jenkins 登录或加载失败：{exc}")
-            self.emit("jenkins_login_finished", (False, "Jenkins 登录或加载失败"))
+            message = f"Jenkins 登录或加载失败：{exception_message(exc)}"
+            self.emit("jenkins_login_finished", (False, message))
+            self.emit("error", message)
         finally:
             self.emit("loading_stop", None)
 
-    def _fetch_job_cache(self, path=None):
+    def _fetch_job_cache(self, path=None, *, client=None):
+        client = client or self.jenkins
         path = list(path or [])
         cache = []
-        for job in self.jenkins.list_jobs(path):
+        for job in client.list_jobs(path):
             node = {
                 "name": job.get("name", ""),
                 "displayName": job.get("displayName") or job.get("name", ""),
@@ -4417,7 +4910,7 @@ class DeployTool(QMainWindow):
             }
             if "folder" in node["_class"].lower():
                 node["children"] = self._fetch_job_cache(
-                    path + [node["name"]]
+                    path + [node["name"]], client=client
                 )
             cache.append(node)
         return cache
@@ -4472,10 +4965,33 @@ class DeployTool(QMainWindow):
         }
         self.store.save()
 
-    def _load_job_cache(self, generation):
+    @staticmethod
+    def _parameter_cache_key(client, path, job_url):
+        return json.dumps([
+            *DeployTool._job_cache_identity(client), path, job_url.rstrip("/")
+        ], ensure_ascii=False)
+
+    def _start_job_cache_load(self, cached_jobs=None):
+        generation = self._job_cache_generation
+        client = self.jenkins
+        self._job_cache_loading = True
+        self.job_tree.setEnabled(False)
+        self.job_cache_refresh_button.setEnabled(False)
+        self.job_filter_input.setEnabled(False)
+        self._update_build_cloud_ready()
+        self.emit("loading_start", "正在验证 Jenkins 并加载任务树...")
+        self.run_thread(lambda: self._load_job_cache(generation, client, cached_jobs))
+
+    def _load_job_cache(self, generation, client, cached_jobs=None):
         try:
-            cache = self._fetch_job_cache()
-            self.emit("job_cache_loaded", (generation, cache))
+            if generation != self._job_cache_generation or client is not self.jenkins:
+                return
+            # A local task tree says nothing about the current credentials.
+            client.verify_authentication()
+            cache = cached_jobs if cached_jobs is not None else self._fetch_job_cache(client=client)
+            self.emit("job_cache_loaded", (generation, {
+                "client": client, "jobs": cache, "cached": cached_jobs is not None,
+            }))
         except Exception as exc:
             self.emit("job_cache_error", (generation, exception_message(exc)))
         finally:
@@ -4536,20 +5052,28 @@ class DeployTool(QMainWindow):
         if hasattr(self, "job_search_timer"):
             self.job_search_timer.stop()
         self._job_cache_generation += 1
-        generation = self._job_cache_generation
-        self.job_cache_refresh_button.setEnabled(False)
-        self.job_filter_input.setEnabled(False)
-        self.path_label.setText("  正在刷新 Jenkins 任务缓存...")
-        self.emit("loading_start", "正在刷新 Jenkins 任务缓存...")
-        self.run_thread(lambda: self._load_job_cache(generation))
+        self._start_job_cache_load()
 
     @Slot(int, object)
-    def _on_job_cache_loaded(self, generation, cache):
-        if generation != self._job_cache_generation:
+    def _on_job_cache_loaded(self, generation, result):
+        if generation != self._job_cache_generation or result["client"] is not self.jenkins:
             return
+        cache = result["jobs"]
+        self._job_cache_loading = False
+        self.job_tree.setEnabled(True)
+        self._parameter_requests.clear()
+        self._active_parameter_key = None
+        self._displayed_parameter_key = None
+        self.current_job_path = []
+        self.current_job_url = ""
+        self._select_build_summary()
+        self.current_display_path = []
+        self._show_parameters([], [])
+        self.build_button.setEnabled(False)
         self.job_tree_cache = cache
         try:
-            self._save_job_cache(cache)
+            if not result.get("cached"):
+                self._save_job_cache(cache)
         except (OSError, TypeError, ValueError) as exc:
             self.emit(
                 "error",
@@ -4567,23 +5091,32 @@ class DeployTool(QMainWindow):
             self.path_label.setText(
                 f"  Jenkins 已连接，已缓存 {self._count_job_cache_nodes(cache)} 个任务"
             )
+        source = "已加载本地缓存" if result.get("cached") else "已缓存"
+        message = (
+            f"Jenkins 登录成功；{source} {self._count_job_cache_nodes(cache)} 个任务；"
+            "点击任务后加载构建参数"
+        )
         self.emit(
             "jenkins_login_finished",
-            (True, f"Jenkins 已连接，已缓存 {self._count_job_cache_nodes(cache)} 个任务"),
+            (True, message),
         )
 
     @Slot(int, str)
     def _on_job_cache_error(self, generation, message):
         if generation != self._job_cache_generation:
             return
+        self._job_cache_loading = False
+        self.job_tree.setEnabled(True)
+        self._update_build_cloud_ready()
         self.job_filter_input.setEnabled(bool(self.job_tree_cache))
         self.job_cache_refresh_button.setEnabled(bool(self.jenkins))
         if self.job_tree_cache:
             self.path_label.setText(f"  任务缓存刷新失败：{message}")
             self.emit("error", f"Jenkins 任务缓存刷新失败：{message}")
         else:
-            self.emit("error", f"Jenkins 登录或任务缓存失败：{message}")
-            self.emit("jenkins_login_finished", (False, "Jenkins 登录或任务缓存失败"))
+            message = f"Jenkins 登录或任务加载失败：{message}"
+            self.emit("jenkins_login_finished", (False, message))
+            self.emit("error", message)
 
     def _start_job_search(self):
         if not hasattr(self, "job_filter_input") or not self.jenkins:
@@ -4732,19 +5265,11 @@ class DeployTool(QMainWindow):
             self.emit("loading_stop", None)
 
     def _tree_select(self, item, column):
-        if not self.jenkins:
+        if not self.jenkins or getattr(self, "_job_cache_loading", False):
             return
         data = item.data(0, Qt.UserRole)
         if not data:
             return
-        # Folder rows only navigate the task hierarchy. Selecting them must not
-        # start a Jenkins parameter request.
-        if data.get("is_folder") or item.childCount():
-            return
-        path = data.get("path", [])
-        self.current_job_path = path
-        self.current_job_url = data.get("url", "")
-
         # Build display path
         display_path = []
         current = item
@@ -4752,16 +5277,295 @@ class DeployTool(QMainWindow):
             display_path.append(current.text(0))
             current = current.parent()
         self.current_display_path = list(reversed(display_path))
+        self._selected_module_path = self.current_display_path
+        is_folder = data.get("is_folder") or item.childCount()
+        path = data.get("path", [])
+        self.current_job_path = [] if is_folder else path
+        self.current_job_url = "" if is_folder else data.get("url", "")
         self.path_label.setText("  " + " / ".join(self.current_display_path))
+        self._sync_cloud_target_from_job()
         self._update_build_cloud_ready()
+        self._select_build_summary()
 
+        # Module selection updates targets, but only a leaf requests parameters.
+        if is_folder:
+            self._active_parameter_key = None
+            self.build_button.setEnabled(False)
+            return
+
+        client = self.jenkins
+        key = self._parameter_cache_key(client, path, self.current_job_url)
+        self._active_parameter_key = key
+        params = self._cached_parameters(key)
+        if params is not None:
+            if key == self._displayed_parameter_key:
+                self._update_build_cloud_ready()
+                return
+            self._displayed_parameter_key = key
+            self._show_parameters(path, params)
+            self._update_build_cloud_ready()
+            return
+        if self._displayed_parameter_key is not None:
+            self._displayed_parameter_key = None
+            self._show_parameters(path, [])
+        self._update_build_cloud_ready()
+        if key in self._parameter_requests and self._parameter_requests[key]["client"] is client:
+            return
+        request = {"key": key, "path": list(path), "client": client, "job_url": self.current_job_url}
+        self._parameter_requests[key] = request
         self.emit("loading_start", "正在加载构建参数...")
-        self.run_thread(lambda: self._load_parameters(path))
+        self.run_thread(lambda: self._load_parameters(request))
 
-    def _load_parameters(self, path):
+    def _build_summary_selection(self):
+        if not self.jenkins or not self.current_job_path:
+            return None
+        return (self.jenkins, tuple(self.current_job_path), self.current_job_url)
+
+    def _select_build_summary(self):
+        selection = self._build_summary_selection()
+        if selection == self._summary_selection:
+            return
+        self._summary_selection = selection
+        self._summary_request = None
+        self._summary_build_url = ""
+        self._summary_timer.stop()
+        self.build_summary_scm.hide()
+        self.build_changes.clear()
+        self.build_changes.hide()
+        self.build_changes_title.hide()
+        self.build_changes_title.setText("Changes · 提交变更")
+        self.build_summary_open_button.setEnabled(False)
+        self.build_summary_refresh_button.setText("刷新状态集")
+        self.build_summary_label.setToolTip("")
+        self.build_summary_refresh_button.setEnabled(False)
+        if not selection:
+            self.build_summary_label.setText("请选择 Jenkins 构建任务")
+            return
+        run = self._summary_runs.get(selection)
+        if not run:
+            self.build_summary_label.setText("当前模块尚未打包，打包后显示本次构建详情")
+            return
+        self._summary_build_url = run["build_url"]
+        if not self._summary_build_url:
+            self.build_summary_label.setText(
+                "本次打包已结束，未生成构建详情" if run["finished"]
+                else "本次构建正在提交或排队，等待构建编号…"
+            )
+            return
+        self.build_changes_title.show()
+        self.build_changes.show()
+        self.build_summary_label.setText("正在加载构建状态集…")
+        self._refresh_build_summary()
+
+    def _refresh_build_summary(self):
+        selection = self._summary_selection
+        if (not selection or selection != self._build_summary_selection()
+                or self._summary_request or not self._summary_build_url):
+            return
+        self._summary_timer.stop()
+        client, path, job_url = selection
+        build_url = self._summary_build_url
+        request = {"selection": selection, "build_url": build_url}
+        self._summary_request = request
+        self.build_summary_refresh_button.setEnabled(False)
+        self.build_summary_refresh_button.setText("加载中…")
+
+        def load():
+            try:
+                data = client.get_build_summary(
+                    list(path), job_url=job_url, build_url=request["build_url"]
+                )
+                payload = {"request": request, "data": data}
+            except Exception as exc:
+                payload = {"request": request, "error": str(exc)}
+            self.sig_build_summary.emit(payload)
+
+        self.run_thread(load)
+
+    @Slot(object)
+    def _on_build_summary(self, payload):
+        request = payload["request"]
+        if (request is not self._summary_request
+                or request["selection"] != self._build_summary_selection()):
+            return
+        self._summary_request = None
+        self.build_summary_refresh_button.setEnabled(True)
+        self.build_summary_refresh_button.setText("刷新状态集")
+        if "error" in payload:
+            self.build_summary_label.setText(
+                "状态集加载失败，以下保留上次结果；请刷新重试"
+                if self._summary_build_url else "状态集加载失败，请点击刷新重试"
+            )
+            self.build_summary_label.setToolTip(payload["error"])
+            return
+        self.build_summary_label.setToolTip("")
+        data = payload["data"]
+        if not data:
+            self.build_summary_open_button.setEnabled(False)
+            self.build_summary_scm.hide()
+            self.build_changes_title.setText("Changes · 提交变更（0）")
+            self.build_summary_label.setText("本次构建详情暂不可用，请刷新重试")
+            self.build_changes.setPlainText("暂无提交变更")
+            return
+        self._summary_build_url = request["build_url"]
+        self.build_summary_open_button.setEnabled(bool(self._summary_build_url))
+        result = "构建中" if data.get("building") else {
+            "SUCCESS": "成功", "FAILURE": "失败", "UNSTABLE": "不稳定",
+            "ABORTED": "已取消", "NOT_BUILT": "未构建",
+        }.get(data.get("result"), data.get("result") or "状态未知")
+        timestamp = data.get("timestamp")
+        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp / 1000)) if timestamp else ""
+        self.build_summary_label.setText("  ·  ".join(filter(None, (
+            f"本次构建 #{data.get('number', '—')}  {result}", started,
+        ))))
+        details = []
+        for action in data.get("actions") or []:
+            for cause in action.get("causes") or []:
+                text = f"启动用户：{cause['userName']}" if cause.get("userName") else cause.get("shortDescription", "")
+                if text and text not in details:
+                    details.append(text)
+            revision = action.get("lastBuiltRevision") or {}
+            branches = [branch["name"] for branch in revision.get("branch") or [] if branch.get("name")]
+            if branches:
+                details.append("分支：" + " / ".join(branches))
+            if revision.get("SHA1"):
+                details.append("Revision：" + revision["SHA1"])
+        self.build_summary_scm.setText("\n".join(details))
+        self.build_summary_scm.setVisible(bool(details))
+        # Freestyle jobs expose changeSet; Pipeline jobs expose changeSets.
+        change_sets = data.get("changeSets") or []
+        if not change_sets and data.get("changeSet"):
+            change_sets = [data["changeSet"]]
+        changes = [item for change_set in change_sets for item in change_set.get("items") or []]
+        lines = []
+        for index, change in enumerate(changes, 1):
+            message = str(change.get("msg") or "（无提交说明）").strip()
+            author = (change.get("author") or {}).get("fullName", "")
+            revision = str(change.get("commitId") or change.get("id") or "")[:12]
+            metadata = " · ".join(filter(None, (author, revision)))
+            lines.append(f"{index}. {message}" + (f"\n    {metadata}" if metadata else ""))
+        self.build_changes_title.setText(f"Changes · 提交变更（{len(changes)}）")
+        text = "\n\n".join(lines) if lines else (
+            "构建进行中，Jenkins 暂未返回提交变更" if data.get("building") else "本次构建无提交变更"
+        )
+        if text != self.build_changes.toPlainText():
+            self.build_changes.setPlainText(text)
+        if data.get("building"):
+            self._summary_timer.start()
+
+    def _open_build_summary(self):
+        if self._summary_build_url:
+            webbrowser.open(self._summary_build_url)
+
+    def _cached_selection(self, kind, key):
+        record = self.store.data.get("selection_cache")
+        if not isinstance(record, dict) or record.get("version") != 1:
+            return None
+        entries = record.get(kind)
+        return copy.deepcopy(entries.get(key)) if isinstance(entries, dict) else None
+
+    def _save_selection_cache(self, kind, key, value, *, save=True):
+        record = self.store.data.get("selection_cache")
+        if not isinstance(record, dict) or record.get("version") != 1:
+            record = {"version": 1}
+            self.store.data["selection_cache"] = record
+        if not isinstance(record.get(kind), dict):
+            record[kind] = {}
+        if record[kind].get(key) == value:
+            return
+        if kind == "cloud_targets":
+            identity = json.loads(key)[:3]
+            for other_key, other in list(record[kind].items()):
+                try:
+                    other_identity = json.loads(other_key)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(other_identity, list) or other_identity[:3] != identity:
+                    continue
+                if not isinstance(other, dict):
+                    continue
+                project = other.get("project", "")
+                if project and project not in value["projects"]:
+                    record[kind].pop(other_key)
+                else:
+                    other["projects"] = list(value["projects"])
+        record[kind][key] = copy.deepcopy(value)
+        if save:
+            self._persist_selection_cache()
+
+    def _persist_selection_cache(self):
         try:
-            self.emit("params", (path, self.jenkins.get_parameters(path)))
+            self.store.save()
+        except (OSError, TypeError, ValueError) as exc:
+            self.emit("error", f"数据已加载，但本地缓存保存失败：{exception_message(exc)}")
+
+    def _cached_parameters(self, key):
+        params = self._cached_selection("parameters", key)
+        if not isinstance(params, list):
+            return None
+        for param in params:
+            if (
+                not isinstance(param, dict)
+                or not isinstance(param.get("name"), str)
+                or not isinstance(param.get("type", ""), str)
+                or not isinstance(param.get("defaultParameterValue", {}), dict)
+                or not isinstance(param.get("choices", []), list)
+            ):
+                return None
+        return params
+
+    @staticmethod
+    def _parameter_cache_value(params):
+        cached = copy.deepcopy(params)
+        for param in cached:
+            # Password defaults are credentials, not reusable UI metadata.
+            if "password" in str(param.get("type", "")).lower():
+                param.pop("defaultParameterValue", None)
+                param.pop("choices", None)
+        return cached
+
+    def _save_parameter_cache(self, key, params):
+        self._save_selection_cache("parameters", key, self._parameter_cache_value(params))
+
+    def _sync_cloud_target_from_job(self):
+        project = extract_job_project_code(self._selected_module_path)
+        if not project:
+            return
+        leaf = self._selected_module_path[-1].upper()
+        preferred_type = ""
+        if re.match(r"^\d+-WEB(?:\W|$)", leaf):
+            preferred_type = f"{project.lower()} 前端"
+        elif re.match(r"^\d+-SERVICE(?:\W|$)", leaf):
+            preferred_type = f"{project.lower()} 后端"
+        elif re.match(r"^\d+-APP(?:\W|$)", leaf):
+            project = f"{project}mobile"
+            preferred_type = f"{project.lower()} 前端"
+        for source, project_widget in (
+            ("build", self.build_cloud_project), ("tab", self.cloud_project)
+        ):
+            project_widget.setCurrentText(project.lower())
+            settings = (
+                self._build_cloud_settings_from_ui() if source == "build"
+                else self._cloud_settings_from_ui()
+            )
+            if preferred_type:
+                settings["deploy_type"] = preferred_type
+            elif settings.get("deploy_type"):
+                settings["deploy_type"] = service_type_label(
+                    project, service_type_id(settings["deploy_type"])
+                )
+            if self._cloud_account_complete(settings):
+                self._queue_cloud_options(settings, source)
+            elif source == "build":
+                self.build_cloud_target_dirty = True
+
+    def _load_parameters(self, request):
+        try:
+            self.emit("params", (request, request["client"].get_parameters(
+                request["path"], job_url=request["job_url"]
+            )))
         except Exception as exc:
+            self.emit("params", (request, None))
             self.emit("error", f"构建参数加载失败：{exc}")
         finally:
             self.emit("loading_stop", None)
@@ -4769,12 +5573,17 @@ class DeployTool(QMainWindow):
     # ── Build Parameters (CRITICAL) ────────────────────────────────
     def _show_parameters(self, path, params):
         # Clear existing parameter widgets
+        self._set_parameters_expanded(True)
+        self._branch_summary_rows = []
         while self.params_layout.count():
             child = self.params_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
 
         self.param_vars = {}
+        self.param_refresh_buttons = {}
+        self._parameter_generation = getattr(self, "_parameter_generation", 0) + 1
+        self._branch_refresh_requests = {}
         saved = self.store.data["jenkins"].setdefault("values", {}).get("/".join(path), {})
 
         if not params:
@@ -4798,6 +5607,8 @@ class DeployTool(QMainWindow):
                 remote_name = f"origin/{default}"
                 default = remote_name if remote_name in choices else choices[0]
 
+            refreshable_branch = self._is_refreshable_branch_parameter(name, param)
+
             # Name label
             name_label = QLabel(name)
             name_label.setStyleSheet(f"""
@@ -4807,7 +5618,7 @@ class DeployTool(QMainWindow):
             self.params_layout.addWidget(name_label, row, 0, Qt.AlignLeft | Qt.AlignVCenter)
 
             # Input widget
-            if choices:
+            if choices or refreshable_branch:
                 widget = SearchableComboBox()
                 widget.set_values(choices)
                 widget.setCurrentText("" if default is None else str(default))
@@ -4821,7 +5632,40 @@ class DeployTool(QMainWindow):
                 widget.setText("" if default is None else str(default))
                 self.param_vars[name] = ("text", widget)
 
-            self.params_layout.addWidget(widget, row, 1)
+            if refreshable_branch:
+                # Keep the refresh control next to the branch selector so a
+                # user can update only this remote list without resetting the
+                # other Jenkins parameters already entered in the form.
+                input_row = QWidget()
+                input_layout = QHBoxLayout(input_row)
+                input_layout.setContentsMargins(0, 0, 0, 0)
+                input_layout.setSpacing(6)
+                input_layout.addWidget(widget, 1)
+
+                refresh_button = QPushButton("刷新分支")
+                refresh_button.setObjectName("GhostBtn")
+                # The global button padding/minimum used to override the
+                # fixed 34px height and push this button below the combo.
+                refresh_button.setStyleSheet(
+                    "QPushButton { min-height: 0; padding: 0 14px; }"
+                )
+                widget.ensurePolished()
+                row_height = widget.sizeHint().height()
+                widget.setFixedHeight(row_height)
+                refresh_button.setFixedHeight(row_height)
+                refresh_button.setAutoDefault(False)
+                refresh_button.setAccessibleName(f"刷新 {name} 分支列表")
+                refresh_button.setToolTip("重新从 Jenkins 获取最新的打包分支")
+                refresh_button.clicked.connect(
+                    lambda _checked=False, parameter=name: self.refresh_branch_choices(
+                        parameter
+                    )
+                )
+                input_layout.addWidget(refresh_button)
+                self.param_refresh_buttons[name] = refresh_button
+                self.params_layout.addWidget(input_row, row, 1)
+            else:
+                self.params_layout.addWidget(widget, row, 1)
 
             # Description
             description = param.get("description")
@@ -4835,6 +5679,266 @@ class DeployTool(QMainWindow):
                 """)
                 desc_label.setWordWrap(True)
                 self.params_layout.addWidget(desc_label, row, 2, Qt.AlignLeft | Qt.AlignVCenter)
+
+            if name.upper() == "GIT_BRANCH":
+                self._branch_summary_rows.append((row, [
+                    (column, self.params_layout.itemAtPosition(row, column).widget())
+                    for column in range(3)
+                    if self.params_layout.itemAtPosition(row, column) is not None
+                ]))
+
+        self._set_parameters_expanded(self.params_card._toggle.isChecked())
+
+    def _set_parameters_expanded(self, expanded):
+        # Move the same controls between layouts so edits and branch refresh
+        # always operate on the values used by start_build.
+        source = self.branch_summary_layout if expanded else self.params_layout
+        target = self.params_layout if expanded else self.branch_summary_layout
+        for compact_row, (original_row, cells) in enumerate(self._branch_summary_rows):
+            for column, widget in cells:
+                source.removeWidget(widget)
+                target.addWidget(
+                    widget, original_row if expanded else compact_row, column,
+                    Qt.AlignVCenter,
+                )
+                widget.show()
+        self.branch_summary.setVisible(bool(self._branch_summary_rows) and not expanded)
+
+    @staticmethod
+    def _is_refreshable_branch_parameter(name, param):
+        """Return whether a Jenkins parameter should expose branch refresh."""
+        normalized_name = str(name or "").strip().upper()
+        parameter_type = str(param.get("type", "") or "").strip().lower()
+        return (
+            bool(normalized_name)
+            and (
+                normalized_name.startswith("GIT_BRANCH")
+                or (
+                    "gitparameterdefinition" in parameter_type
+                    and "BRANCH" in normalized_name
+                )
+            )
+        )
+
+    @staticmethod
+    def _preferred_branch_choice(current, choices):
+        """Choose the closest refreshed value while avoiding stale branches."""
+        choices = list(choices or [])
+        current = str(current or "")
+        if current in choices:
+            return current
+        if current.startswith("origin/") and current[7:] in choices:
+            return current[7:]
+        if current and f"origin/{current}" in choices:
+            return f"origin/{current}"
+        return choices[0] if choices else current
+
+    def refresh_branch_choices(self, name):
+        """Refresh one Git branch parameter asynchronously from Jenkins."""
+        name = str(name or "").strip()
+        client = getattr(self, "jenkins", None)
+        path = list(getattr(self, "current_job_path", []) or [])
+        info = getattr(self, "param_vars", {}).get(name)
+        button = getattr(self, "param_refresh_buttons", {}).get(name)
+        if (
+            not name
+            or client is None
+            or not path
+            or not info
+            or info[0] != "combo"
+        ):
+            return
+
+        requests = getattr(self, "_branch_refresh_requests", {})
+        if name in requests:
+            return
+
+        self._branch_refresh_generation = getattr(
+            self, "_branch_refresh_generation", 0
+        ) + 1
+        request_id = self._branch_refresh_generation
+        parameter_generation = getattr(self, "_parameter_generation", 0)
+        token = (name, parameter_generation, request_id)
+        requests[name] = (parameter_generation, request_id)
+        active_tokens = getattr(self, "_branch_refresh_active_tokens", set())
+        active_tokens.add(token)
+        self._branch_refresh_active_tokens = active_tokens
+        self._branch_refresh_requests = requests
+
+        if button is not None:
+            button.setEnabled(False)
+            button.setText("刷新中…")
+        self.emit("loading_start", f"正在刷新 {name} 分支...")
+
+        job_url = str(getattr(self, "current_job_url", "") or "").strip()
+        if not job_url:
+            job_url = jenkins_job_api_url(getattr(client, "url", ""), path)
+        self.run_thread(
+            lambda: self._load_branch_choices(
+                client,
+                job_url,
+                name,
+                path,
+                parameter_generation,
+                request_id,
+            ),
+            lambda: self._finish_branch_refresh(
+                name, parameter_generation, request_id
+            ),
+        )
+
+    def _load_branch_choices(
+        self, client, job_url, name, path, parameter_generation, request_id
+    ):
+        try:
+            fetch_choices = getattr(client, "get_git_parameter_choices", None)
+            if fetch_choices is None:
+                # Compatibility with injected/test clients that still expose
+                # only the original private Jenkins helper.
+                fetch_choices = getattr(client, "_get_git_parameter_choices", None)
+            if fetch_choices is None:
+                get_parameters = getattr(client, "get_parameters", None)
+                refreshed = get_parameters(path) if get_parameters else []
+                match = next(
+                    (
+                        item
+                        for item in refreshed or []
+                        if isinstance(item, dict) and item.get("name") == name
+                    ),
+                    {},
+                )
+                choices = match.get("choices") or []
+            else:
+                choices = fetch_choices(job_url, name)
+            if isinstance(choices, str):
+                choices = [choices]
+            else:
+                try:
+                    choices = list(choices or [])
+                except TypeError:
+                    # A lightweight injected client may expose only the
+                    # complete parameter endpoint.  Fall back to it when a
+                    # stubbed single-parameter call has no iterable result.
+                    get_parameters = getattr(client, "get_parameters", None)
+                    if get_parameters is None:
+                        choices = []
+                    else:
+                        refreshed = get_parameters(path)
+                        match = next(
+                            (
+                                item
+                                for item in refreshed or []
+                                if isinstance(item, dict) and item.get("name") == name
+                            ),
+                            {},
+                        )
+                        choices = list(match.get("choices") or [])
+            normalized = []
+            seen = set()
+            for value in choices:
+                value = str(value).strip()
+                if value and value not in seen:
+                    normalized.append(value)
+                    seen.add(value)
+            self.emit(
+                "branch_choices",
+                (
+                    client,
+                    tuple(path),
+                    name,
+                    parameter_generation,
+                    request_id,
+                    normalized,
+                ),
+            )
+        except Exception as exc:
+            self.emit(
+                "branch_refresh_error",
+                (
+                    name,
+                    parameter_generation,
+                    request_id,
+                    exception_message(exc),
+                ),
+            )
+
+    @Slot(object)
+    def _on_branch_choices(self, payload):
+        (
+            client,
+            path,
+            name,
+            parameter_generation,
+            request_id,
+            choices,
+        ) = payload
+        active = getattr(self, "_branch_refresh_requests", {}).get(name)
+        if (
+            active != (parameter_generation, request_id)
+            or parameter_generation != getattr(self, "_parameter_generation", 0)
+            or client is not getattr(self, "jenkins", None)
+            or tuple(getattr(self, "current_job_path", []) or []) != tuple(path)
+        ):
+            return
+        info = getattr(self, "param_vars", {}).get(name)
+        if not info or info[0] != "combo":
+            return
+        widget = info[1]
+        current = widget.currentText()
+        widget.set_values(choices)
+        selected = self._preferred_branch_choice(current, choices)
+        if selected:
+            widget.setCurrentText(selected)
+        key = getattr(self, "_displayed_parameter_key", None)
+        params = self._cached_parameters(key) if key else None
+        if params is not None:
+            for param in params:
+                if param.get("name") == name:
+                    param["choices"] = list(choices)
+            self._save_parameter_cache(key, params)
+        button = getattr(self, "param_refresh_buttons", {}).get(name)
+        if button is not None:
+            button.setToolTip(f"已获取 {len(choices)} 个最新分支；点击可再次刷新")
+
+    @Slot(object)
+    def _on_branch_refresh_error(self, payload):
+        name, parameter_generation, request_id, message = payload
+        active = getattr(self, "_branch_refresh_requests", {}).get(name)
+        if (
+            active != (parameter_generation, request_id)
+            or parameter_generation != getattr(self, "_parameter_generation", 0)
+        ):
+            return
+        overlay = getattr(self, "message_overlay", None)
+        if overlay is not None:
+            overlay.show_message(
+                "分支刷新失败",
+                f"{name}：{message}",
+                kind="error",
+            )
+        else:
+            self.emit("error", f"{name}：{message}")
+
+    def _finish_branch_refresh(self, name, parameter_generation, request_id):
+        token = (name, parameter_generation, request_id)
+        active_tokens = getattr(self, "_branch_refresh_active_tokens", set())
+        if token not in active_tokens:
+            # QThread exposes its own ``finished`` signal and Worker also
+            # emits a compatibility signal with the same name, so a callback
+            # can arrive twice.  Only the first completion owns the loading
+            # indicator and button state.
+            return
+        active_tokens.remove(token)
+        active = getattr(self, "_branch_refresh_requests", {}).get(name)
+        if active == (parameter_generation, request_id):
+            self._branch_refresh_requests.pop(name, None)
+            button = getattr(self, "param_refresh_buttons", {}).get(name)
+            if button is not None:
+                button.setEnabled(bool(getattr(self, "jenkins", None)))
+                button.setText("刷新分支")
+        # Every request emits one loading_start, including requests that
+        # became stale after the user selected another Jenkins job.
+        self.emit("loading_stop", None)
 
     def _get_param_value(self, name):
         """Get the current value of a build parameter."""
@@ -4996,7 +6100,7 @@ class DeployTool(QMainWindow):
                     "缺少云端账号",
                     "当前没有完整的 Ops 登录信息，请先到“云端部署”页填写账号和密码。",
                 )
-                self.tab_widget.setCurrentIndex(2)
+                DeployTool._select_page(self, "CloudDeployPage")
             return
         if not refresh_cloud:
             self.build_cloud_loading_label.setText(
@@ -5037,6 +6141,16 @@ class DeployTool(QMainWindow):
     def _update_build_cloud_ready(self):
         if not hasattr(self, "build_deploy_mode"):
             return
+        if getattr(self, "_job_cache_loading", False):
+            self.build_button.setEnabled(False)
+            return
+        if (
+            getattr(self, "current_job_path", [])
+            and getattr(self, "_active_parameter_key", None)
+            != getattr(self, "_displayed_parameter_key", None)
+        ):
+            self.build_button.setEnabled(False)
+            return
         if not DeployTool._deploy_after_build_enabled(self):
             self.build_button.setEnabled(not self.build_running)
             return
@@ -5070,8 +6184,10 @@ class DeployTool(QMainWindow):
                 self.build_cloud_loading_label.setStyleSheet(
                     f'color: {COLORS["text_secondary"]}; background: transparent;'
                 )
+                module = extract_job_project_code(self.current_display_path)
                 self.build_cloud_loading_label.setText(
-                    "任务层级尚未确认，暂不识别部署专案"
+                    f"已匹配 {module}，请选择具体构建任务"
+                    if module else "任务层级尚未确认，暂不识别部署专案"
                 )
                 return
             job_project = extract_job_project_code(self.current_display_path)
@@ -5095,7 +6211,7 @@ class DeployTool(QMainWindow):
                 )
                 self.build_cloud_loading_label.setText("云端部署目标已就绪")
 
-    def refresh_build_cloud_options(self):
+    def refresh_build_cloud_options(self, *, force=False):
         if self.build_cloud_loading:
             return
         settings = self._build_cloud_settings_from_ui()
@@ -5106,15 +6222,9 @@ class DeployTool(QMainWindow):
                 "缺少云端账号",
                 "请先到“云端部署”页填写 Ops 登录账号和密码。",
             )
-            self.tab_widget.setCurrentIndex(2)
+            DeployTool._select_page(self, "CloudDeployPage")
             return
-        self._set_build_cloud_loading(True, "正在登录并刷新云端部署目标...")
-        self.build_cloud_target_dirty = True
-        if self._cloud_api_is_alive():
-            self.run_thread(lambda: self._load_cloud_options(settings, "build"))
-        else:
-            self.cloud_project_names = []
-            self.run_thread(lambda: self._login_and_load_cloud(settings, "build"))
+        self._queue_cloud_options(settings, "build", force=force)
 
     @staticmethod
     def _deployment_target_key(mode, environment=None, cloud_settings=None):
@@ -5227,7 +6337,7 @@ class DeployTool(QMainWindow):
                     self, "缺少云端账号",
                     "请先到“云端部署”页填写 Ops 登录账号和密码。",
                 )
-                self.tab_widget.setCurrentIndex(2)
+                DeployTool._select_page(self, "CloudDeployPage")
                 return
             if any(
                 not cloud_settings.get(key)
@@ -5290,6 +6400,30 @@ class DeployTool(QMainWindow):
         key = "/".join(self.current_job_path)
         self.store.data["jenkins"].setdefault("values", {})[key] = params
         self.store.save()
+        # Keep credentials/client in memory only. Each attempt gets its own
+        # mutable copy so later form edits and deployment inference cannot
+        # change the configuration used by Continue.
+        snapshot = {"client": self.jenkins, "configuration": copy.deepcopy({
+            "path": list(self.current_job_path), "job_url": self.current_job_url,
+            "display_path": getattr(self, "current_display_path", []),
+            "params": params, "deployment_mode": deployment_mode,
+            "environment": environment, "dashboard": dashboard,
+            "cloud_settings": cloud_settings, "deploy_after_build": deploy_after_build,
+        })}
+        DeployTool._launch_build(self, snapshot)
+
+    def _launch_build(self, snapshot):
+        configuration = copy.deepcopy(snapshot["configuration"])
+        path = configuration["path"]
+        job_url = configuration["job_url"]
+        params = configuration["params"]
+        deployment_mode = configuration["deployment_mode"]
+        environment = configuration["environment"]
+        dashboard = configuration["dashboard"]
+        cloud_settings = configuration["cloud_settings"]
+        deploy_after_build = configuration["deploy_after_build"]
+        self._active_build_client = snapshot["client"]
+        self.cancel_event.clear()
         self.build_log.clear()
         self.build_running = True
         self.active_deploy_after_build = deploy_after_build
@@ -5305,9 +6439,9 @@ class DeployTool(QMainWindow):
             )
         else:
             task_target = environment.get("name", "")
-        display_path = getattr(self, "current_display_path", [])
+        display_path = configuration["display_path"]
         task_title = (
-            display_path[-1] if display_path else self.current_job_path[-1]
+            display_path[-1] if display_path else path[-1]
         )
         if hasattr(self, "_begin_tracked_task"):
             self._begin_tracked_task(
@@ -5315,6 +6449,7 @@ class DeployTool(QMainWindow):
                 task_target,
                 title=task_title,
             )
+        self._last_build_snapshot = snapshot
         self.batch_token = None
         auto_merge_ssh_deployments = bool(
             deploy_after_build
@@ -5331,7 +6466,6 @@ class DeployTool(QMainWindow):
             if hasattr(self, "batch_status_label"):
                 self.batch_status_label.setText("已加入批次，正在打包")
             self._handle_active_batch_registration(active_state)
-        self.cancel_event.clear()
         self.pipeline_phase = "submitting"
         self.pipeline_location = ""
         self.build_button.setEnabled(False)
@@ -5344,13 +6478,19 @@ class DeployTool(QMainWindow):
         self.deploy_log.clear()
         if deploy_after_build and deployment_mode == "SSH 环境部署":
             self.emit("deploy_progress", (0, "等待 Jenkins 打包完成..."))
-        path = list(self.current_job_path)
-        job_url = self.current_job_url
+        if hasattr(self, "_summary_selection"):
+            self._running_summary_selection = (snapshot["client"], tuple(path), job_url)
+            self._running_summary_build_url = ""
+            self._summary_runs[self._running_summary_selection] = {"build_url": "", "finished": False}
+            if self._running_summary_selection == self._build_summary_selection():
+                self._summary_selection = None
+                self._select_build_summary()
+        batch_token = self.batch_token
         self.run_thread(
             lambda: self._run_pipeline(
                 path, params, job_url, deployment_mode,
                 environment, dashboard, cloud_settings, deploy_after_build,
-                self.batch_token,
+                batch_token,
             )
         )
 
@@ -5359,11 +6499,12 @@ class DeployTool(QMainWindow):
         environment, dashboard, cloud_settings, deploy_after_build=True,
         batch_token=None,
     ):
+        client = getattr(self, "_active_build_client", None) or self.jenkins
         try:
             self.emit("build_log", f"提交构建：{' / '.join(path)}")
-            queue_url = self.jenkins.build(path, params, job_url)
+            queue_url = client.build(path, params, job_url)
             self.emit("build_status", "已提交，等待 Jenkins 执行器...")
-            result, console = self.jenkins.wait_for_build(
+            result, console = client.wait_for_build(
                 queue_url,
                 lambda line: self._handle_build_output(line),
                 lambda percent, status: self._handle_build_progress(percent, status),
@@ -5581,7 +6722,8 @@ class DeployTool(QMainWindow):
 
     def _cancel_jenkins_remote(self, phase, location):
         try:
-            self.jenkins.cancel_build(
+            client = getattr(self, "_active_build_client", None) or self.jenkins
+            client.cancel_build(
                 phase,
                 location,
                 lambda message: self.emit("build_log", message),
@@ -5687,8 +6829,6 @@ class DeployTool(QMainWindow):
             self.refresh_environment()
             return
         self.loading_environment = True
-        for key, _ in ENVIRONMENT_FIELDS:
-            pass
         for _, key in ENVIRONMENT_FIELDS:
             value = item.get(key, DEFAULT_DEPLOY.get(key, ""))
             if key == "password":
@@ -5715,9 +6855,6 @@ class DeployTool(QMainWindow):
             QMessageBox.warning(self, "未选择环境", "请先选择要保存的环境")
             return
         data = {key: self._get_env_var(key).strip() for _, key in ENVIRONMENT_FIELDS}
-        if not data["name"] or not data["host"] or not data["username"]:
-            QMessageBox.warning(self, "缺少信息", "环境名称、IP/主机和账号不能为空")
-            return
         dashboard = next(
             (
                 item for item in self.store.data.get("dashboards", [])
@@ -5725,15 +6862,9 @@ class DeployTool(QMainWindow):
             ),
             None,
         )
-        if dashboard is None:
-            QMessageBox.warning(self, "Dashboard 无效", "请选择已保存的 Dashboard")
-            return
-        try:
-            port = int(data["port"])
-            if not 1 <= port <= 65535:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, "端口无效", "SSH 端口必须是 1-65535")
+        error = _environment_validation_error(data, dashboard is not None)
+        if error:
+            QMessageBox.warning(self, *error)
             return
         data["password"] = protect_secret(data["password"])
         if any(
@@ -6121,27 +7252,63 @@ class DeployTool(QMainWindow):
         stderr.read()
         return stdout.channel.recv_exit_status() == 0
 
+    @staticmethod
+    def _probe_remote_image(client, image_ref):
+        """Return visibility and a safe diagnostic without logging registry output."""
+        command = (
+            "docker manifest inspect --insecure "
+            f"{shell_quote(image_ref)} >/dev/null"
+        )
+        _, stdout, stderr = client.exec_command(command)
+        stdout.read()
+        error = stderr.read().decode("utf-8", "replace").casefold()
+        code = stdout.channel.recv_exit_status()
+        if code == 0:
+            return True, ""
+        # Registry errors can contain credential-bearing URLs or headers. Emit
+        # only known categories and the exit code, never the raw response.
+        if any(part in error for part in (
+            "unauthorized", "authentication required", "access denied", "denied:", "forbidden",
+        )):
+            reason = "仓库认证或权限失败，请检查目标主机的 Docker 登录与仓库权限"
+        elif any(part in error for part in ("x509", "certificate", "tls")):
+            reason = "TLS/证书校验失败，请检查仓库证书与连接配置"
+        elif "no such host" in error:
+            reason = "DNS 解析失败，请检查目标主机的仓库域名解析"
+        elif any(part in error for part in (
+            "timeout", "timed out", "connection refused", "connection reset",
+            "network is unreachable", "no route to host",
+        )):
+            reason = "网络连接失败，请检查目标主机到仓库的连接"
+        elif code in (126, 127) or any(part in error for part in (
+            "command not found", "docker: not found", "unknown flag", "is not a docker command",
+        )):
+            reason = "Docker 命令不可用或参数不兼容，请检查目标主机的 Docker CLI"
+        elif any(part in error for part in ("no such manifest", "manifest unknown", "name unknown")):
+            return False, f"仓库返回镜像未找到，等待仓库同步（退出码 {code}）"
+        else:
+            reason = "未识别的探测错误，原始输出已省略以保护认证信息"
+        return False, f"镜像探测失败，是否存在尚无法确认（退出码 {code}）：{reason}"
+
     def _wait_for_remote_image(
         self, client, image_ref, timeout_seconds=600, cancel_event=None
     ):
         """Wait for the pushed image to become visible in the target registry."""
-        command = (
-            "docker manifest inspect --insecure "
-            f"{shell_quote(image_ref)} >/dev/null 2>&1"
-        )
         deadline = time.monotonic() + max(1, int(timeout_seconds))
+        last_diagnostic = "尚未取得探测结果"
         while time.monotonic() < deadline:
             if cancel_event and cancel_event.is_set():
                 raise PipelineCancelled("等待目标镜像期间已取消")
-            if self._remote_command_succeeded(client, command):
+            visible, last_diagnostic = self._probe_remote_image(client, image_ref)
+            if visible:
                 return
             remaining = max(1, int(deadline - time.monotonic()))
             self.emit(
                 "deploy_log",
-                f"目标镜像尚未可见，等待仓库同步：{image_ref}（剩余约 {remaining} 秒）",
+                f"{last_diagnostic}：{image_ref}（剩余约 {remaining} 秒）",
             )
             time.sleep(3)
-        raise RuntimeError(f"目标镜像在等待期限内仍不可见：{image_ref}")
+        raise RuntimeError(f"目标镜像确认超时：{image_ref}；最后一次探测：{last_diagnostic}")
 
     def _sftp_update(self, sftp, remote_path, transform, allow_unchanged=False):
         temp_dir = CONFIG_DIR / "temp"
@@ -6436,7 +7603,13 @@ class DeployTool(QMainWindow):
                         f"cd {shell_quote(workspace)}; "
                         f"exec sh -c {shell_quote(data['pull_command'])}"
                     )
-                    managed_command = f"setsid sh -c {shell_quote(managed_body)}"
+                    # Launch without job control so setsid is not a group leader
+                    # and will not fork. Shell wait also works on old setsid.
+                    wait_body = (
+                        f"set +m; setsid sh -c {shell_quote(managed_body)} & "
+                        'wait "$!"'
+                    )
+                    managed_command = f"sh -c {shell_quote(wait_body)}"
                     if coordinator and batch_token:
                         coordinator.set_phase(batch_token, "pull")
                     self._remote_exec(
@@ -6541,7 +7714,7 @@ class DeployTool(QMainWindow):
             "deploy_type": self.cloud_type.currentText().strip(),
             "cloud": cloud.strip(),
             "region": region.strip(),
-            "package": self.package_input.text().strip(),
+            "package": self.cloud_package.text().strip(),
             "status_page": self._cloud_status_settings_from_ui(),
         }
 
@@ -6682,29 +7855,195 @@ class DeployTool(QMainWindow):
     def _cloud_api_is_alive(self):
         return bool(self.ops_api and self.ops_api.authenticated)
 
-    def login_cloud_platform(self):
+    def _invalidate_cloud_account(self, _text=""):
+        for source in self._cloud_option_requests:
+            self._cloud_option_requests[source] += 1
+        self.build_cloud_target_dirty = True
+        self._set_build_cloud_loading(False, "登录信息已修改，请重新加载目标")
+        self._set_cloud_target_loading(False, "登录信息已修改，请重新加载目标")
+
+    @staticmethod
+    def _cloud_options_cache_key(settings):
+        return json.dumps([
+            settings.get("url", "").strip().rstrip("/"),
+            settings.get("username", "").strip(),
+            (settings.get("cloud") or "Huawei").strip().casefold(),
+            settings.get("project", "").strip().casefold(),
+        ], ensure_ascii=False)
+
+    def _cached_cloud_options(self, settings, source):
+        data = self._cached_selection("cloud_targets", self._cloud_options_cache_key(settings))
+        if not isinstance(data, dict):
+            return None
+        if not isinstance(data.get("project"), str):
+            return None
+        if data["project"].casefold() != settings.get("project", "").strip().casefold():
+            return None
+        for field in ("projects", "types"):
+            if not isinstance(data.get(field), list) or not all(
+                isinstance(value, str) for value in data[field]
+            ):
+                return None
+        if data["project"] and data["project"] not in data["projects"]:
+            return None
+        regions_by_type = data.get("regions_by_type")
+        if not isinstance(regions_by_type, dict):
+            return None
+        for deploy_type in data["types"]:
+            regions = regions_by_type.get(deploy_type)
+            if not isinstance(regions, list) or not all(isinstance(value, str) for value in regions):
+                return None
+        return self._cloud_options_payload(settings, source, data)
+
+    @staticmethod
+    def _cloud_options_payload(settings, source, data):
+        preferred = settings.get("deploy_type", "")
+        selected = next(
+            (value for value in data["types"] if service_type_matches(preferred, value)),
+            data["types"][0] if data["types"] else "",
+        )
+        return {
+            "projects": data["projects"], "types": data["types"],
+            "project": data["project"], "type": selected,
+            "regions": data["regions_by_type"].get(selected, []), "source": source,
+            "request_id": settings.get("_options_request_id"),
+        }
+
+    def _cloud_cache_is_complete(self, settings):
+        root = self._cached_cloud_options({**settings, "project": ""}, "tab")
+        return root is not None and all(
+            self._cached_cloud_options({**settings, "project": project}, "tab") is not None
+            for project in root["projects"]
+        )
+
+    def _collect_cloud_cache(self, settings, *, force=False, progress=None):
+        root_settings = {**settings, "project": ""}
+        root = self._cached_cloud_options(root_settings, "tab") if not force else None
+        api = None
+        cloud = settings.get("cloud") or "Huawei"
+        if root is not None:
+            projects = root["projects"]
+        else:
+            api = self._ensure_cloud_login(settings)
+            projects = api.list_projects(cloud, refresh=force)
+        entries = {
+            self._cloud_options_cache_key(root_settings): {
+                "projects": projects, "project": "", "types": [], "regions_by_type": {},
+            },
+        }
+        failures = {}
+        for index, project in enumerate(projects, 1):
+            project_settings = {**settings, "project": project}
+            key = self._cloud_options_cache_key(project_settings)
+            if progress:
+                progress(f"正在缓存云端目标 {index}/{len(projects)}：{project}")
+            if not force and self._cached_cloud_options(project_settings, "tab") is not None:
+                value = self._cached_selection("cloud_targets", key)
+                value["projects"] = list(projects)
+            else:
+                if api is None:
+                    api = self._ensure_cloud_login(settings)
+                try:
+                    options = api.load_target_options(project, cloud, refresh=force)
+                except Exception as exc:
+                    failures[project] = exception_message(exc)
+                    if self._cached_cloud_options(project_settings, "tab") is not None:
+                        previous = self._cached_selection("cloud_targets", key)
+                        previous["projects"] = list(projects)
+                        entries[key] = previous
+                    continue
+                value = {
+                    "projects": projects, "project": project, "types": options["types"],
+                    "regions_by_type": {
+                        service: list(dict.fromkeys(
+                            target["region_label"] for target in options["targets"]
+                            if target.get("deploy_type_label") == service
+                        )) for service in options["types"]
+                    },
+                }
+            entries[key] = value
+        return entries, failures
+
+    def _queue_cloud_options(
+        self, settings, source="tab", *, force=False, package="",
+        open_browser=False, on_finished=None,
+    ):
+        request_source = "build" if source == "build" else "tab"
+        self._cloud_option_requests[request_source] += 1
+        settings = dict(settings)
+        settings["_options_request_id"] = self._cloud_option_requests[request_source]
+        settings["_refresh_options"] = force
+        if not force and not package and not open_browser:
+            cached = self._cached_cloud_options(settings, source)
+            if cached is not None and self._cloud_cache_is_complete(settings):
+                self._on_cloud_options(cached)
+                if on_finished:
+                    on_finished()
+                return
+        if source == "build":
+            self.build_cloud_target_dirty = True
+            self._set_build_cloud_loading(True, "正在加载云端目标（优先使用缓存）...")
+        else:
+            self._set_cloud_target_loading(True, "正在加载部署目标（优先使用缓存）...")
+
+        def load():
+            try:
+                if package:
+                    self._load_cloud_package_target_options(settings, package)
+                else:
+                    self._login_and_load_cloud(settings, source, open_browser=open_browser)
+            except Exception as exc:
+                self.emit("cloud_options", {
+                    "source": source, "request_id": settings["_options_request_id"],
+                    "error": exception_message(exc),
+                })
+
+        self.run_thread(load, on_finished=on_finished)
+
+    def login_cloud_platform(self, *, open_browser=False):
+        if self._cloud_login_in_progress:
+            return
         settings = self._cloud_settings_from_ui()
         if not settings["url"] or not settings["username"] or not settings["password_plain"]:
             QMessageBox.warning(self, "缺少登录信息", "平台地址、登录账号和密码不能为空")
             return
         self._save_cloud_settings(settings)
-        self.cloud_project_names = []
-        self.ops_api = None
+        # Explicit login must also recover an expired API session.
+        self._ops_api_identity = None
+        self._cloud_login_in_progress = True
         self.cloud_login_button.setEnabled(False)
         self.cloud_status_label.setText("正在登录...")
-        self._set_cloud_target_loading(True, "正在登录并加载部署数据...")
-        self.run_thread(lambda: self._login_and_load_cloud(settings))
+        self._queue_cloud_options(
+            settings, force=True, open_browser=open_browser,
+            on_finished=self._finish_cloud_login,
+        )
 
-    def refresh_cloud_options(self):
+    def _finish_cloud_login(self):
+        self._cloud_login_in_progress = False
+        self.cloud_login_button.setEnabled(True)
+
+    def refresh_cloud_options(self, *, force=False):
         if self.cloud_options_loading:
             return
         settings = self._cloud_settings_from_ui()
-        if not self._cloud_api_is_alive():
-            self.login_cloud_platform()
+        if not self._cloud_account_complete(settings):
+            QMessageBox.warning(self, "缺少登录信息", "平台地址、登录账号和密码不能为空")
             return
-        self.cloud_status_label.setText("正在刷新部署数据...")
-        self._set_cloud_target_loading(True, "正在刷新服务类型和云区节点...")
-        self.run_thread(lambda: self._load_cloud_options(settings))
+        self._queue_cloud_options(settings, force=force)
+
+    def apply_cloud_target_from_package(self):
+        package = self.cloud_package.text().strip().strip("[]")
+        try:
+            infer_cloud_deployment_config(package)
+        except ValueError as exc:
+            self.message_overlay.show_message("包号无法解析", str(exc))
+            return
+        settings = self._cloud_settings_from_ui()
+        if not self._cloud_account_complete(settings):
+            self.cloud_target_loading_label.setText("请先补全 Ops 登录信息")
+            return
+        self.cloud_package.setText(package)
+        self._queue_cloud_options(settings, "package", package=package)
 
     def apply_deployment_targets_from_package(self):
         """Resolve SSH and Ops deployment targets when package input presses Enter."""
@@ -6740,13 +8079,9 @@ class DeployTool(QMainWindow):
 
         self.store.data["last_package"] = package
         self.store.save()
+        self.cloud_package.setText(package)
         self.cloud_status_label.setText("正在按包号匹配部署目标...")
-        self._set_cloud_target_loading(
-            True, "正在通过 Ops 校验部署专案和服务类型..."
-        )
-        self.run_thread(
-            lambda: self._load_cloud_package_target_options(settings, package)
-        )
+        self._queue_cloud_options(settings, "package", package=package)
 
     def start_cloud_deploy(self):
         if getattr(self, "_task_runtime_active", False):
@@ -6766,7 +8101,7 @@ class DeployTool(QMainWindow):
         if any(not settings[key] for key in required):
             QMessageBox.warning(
                 self, "部署信息不完整",
-                "请先登录，并选择部署专案、服务类型和云区节点；Jenkins 当前包号不能为空",
+                "请先登录，并选择部署专案、服务类型和云区节点；包号不能为空",
             )
             return
         message = (
@@ -6811,16 +8146,20 @@ class DeployTool(QMainWindow):
                 return element
         return False
 
-    def _ensure_cloud_browser_login(self, settings):
+    def _ensure_cloud_browser_login(self, settings, *, headless=True, report_status=True):
         By = importlib.import_module("selenium.webdriver.common.by").By
         Keys = importlib.import_module("selenium.webdriver.common.keys").Keys
         WebDriverWait = importlib.import_module("selenium.webdriver.support.ui").WebDriverWait
 
         self.emit("cloud_log", "正在打开鼎捷 Ops 云端平台...")
         try:
+            # An explicit login uses a fresh visible session so changed account
+            # credentials cannot silently reuse a previous browser identity.
+            if not headless and self._cloud_driver_is_alive():
+                self.cloud_driver.quit()
+                self.cloud_driver = None
             if not self._cloud_driver_is_alive():
-                # 后台运行浏览器，仅使用平台原生登录和发布流程，不弹出网页窗口。
-                self.cloud_driver = create_browser_driver(headless=True)
+                self.cloud_driver = create_browser_driver(headless=headless)
             driver = self.cloud_driver
             driver.get(settings["url"])
             wait = WebDriverWait(driver, 30)
@@ -6964,80 +8303,94 @@ class DeployTool(QMainWindow):
             )
             driver.execute_script("sessionStorage.setItem('cloud', 'Huawei')")
             self.emit("cloud_log", "登录成功，流水线部署页面已加载。")
-            self.emit("cloud_status", "已登录")
+            if report_status:
+                self.emit("cloud_status", "已登录")
             return driver
         except Exception as exc:
-            self.emit("cloud_status", "登录失败")
+            if report_status:
+                self.emit("cloud_status", "登录失败")
             reason = exception_message(exc)
             self.emit("cloud_log", f"登录失败：{reason}")
             raise RuntimeError(f"Ops 登录失败：{reason}") from exc
 
     def _ensure_cloud_login(self, settings):
-        if self._cloud_api_is_alive():
-            return self.ops_api
-        self.emit("cloud_log", "正在通过 Ops API 登录，不再启动浏览器...")
-        try:
-            client = OpsApiClient()
-            client.login(
-                settings["url"], settings["username"], settings["password_plain"]
-            )
-            self.ops_api = client
-            self.emit("cloud_log", "Ops API 登录成功。")
-            self.emit("cloud_status", "已登录")
-            return client
-        except OpsApiError as exc:
-            self.ops_api = None
-            self.emit("cloud_status", "登录失败")
-            self.emit("cloud_log", f"Ops API 登录失败：{exception_message(exc)}")
-            raise
+        identity = (
+            settings["url"].strip().rstrip("/"), settings["username"].strip(),
+            hashlib.sha256(settings["password_plain"].encode()).digest(),
+        )
+        with self._ops_login_lock:
+            if self._cloud_api_is_alive() and self._ops_api_identity == identity:
+                return self.ops_api
+            self.emit("cloud_log", "正在通过 Ops API 登录...")
+            try:
+                client = OpsApiClient()
+                client.login(
+                    settings["url"], settings["username"], settings["password_plain"]
+                )
+                self.ops_api = client
+                self._ops_api_identity = identity
+                self.emit("cloud_log", "Ops API 登录成功。")
+                self.emit("cloud_status", "已登录")
+                return client
+            except OpsApiError as exc:
+                self.ops_api = None
+                self._ops_api_identity = None
+                self.emit("cloud_status", "登录失败")
+                self.emit("cloud_log", f"Ops API 登录失败：{exception_message(exc)}")
+                raise
 
-    def _login_and_load_cloud(self, settings, source="tab"):
+    def _login_and_load_cloud(self, settings, source="tab", *, open_browser=False):
         self._ensure_cloud_login(settings)
         self._load_cloud_options(settings, source)
+        if open_browser:
+            self.emit("cloud_status", "部署数据已加载，正在打开并登录网页...")
+            try:
+                self._ensure_cloud_browser_login(
+                    settings, headless=False, report_status=False
+                )
+                self.emit("cloud_status", "已登录，Ops 网页已打开")
+            except Exception as exc:
+                self.emit("cloud_status", "API 已登录，网页自动登录失败")
+                self.emit(
+                    "info",
+                    "部署数据已加载，但 Ops 网页自动登录失败："
+                    f"{exception_message(exc)}\n可在浏览器中手动登录，或再次点击登录按钮重试。",
+                )
 
     def _load_cloud_options(self, settings, source="tab"):
-        api = self._ensure_cloud_login(settings)
-        cloud = settings.get("cloud") or "Huawei"
-        self.emit("cloud_log", "正在通过 Ops API 读取部署专案、服务类型和云区节点...")
-        projects = api.list_projects(cloud)
-        target_project = settings.get("project", "").strip()
-        deploy_types = []
-        regions = []
-        selected_type = ""
-        if target_project:
-            options = api.load_target_options(target_project, cloud)
-            deploy_types = options["types"]
-            preferred_type = settings.get("deploy_type", "")
-            selected_type = next(
-                (
-                    value for value in deploy_types
-                    if service_type_matches(preferred_type, value)
-                ),
-                deploy_types[0] if deploy_types else "",
-            )
-            regions = [
-                target["region_label"]
-                for target in options["targets"]
-                if target.get("deploy_type_label") == selected_type
-            ]
-            regions = list(dict.fromkeys(regions))
-            if target_project not in projects:
-                projects.append(target_project)
-        self.emit(
-            "cloud_options",
-            {
-                "projects": projects,
-                "types": deploy_types,
-                "regions": regions,
-                "project": target_project,
-                "type": selected_type,
-                "source": source,
-            },
+        refresh = settings.get("_refresh_options", False)
+        self.emit("cloud_log", "正在全量刷新云端目标..." if refresh else "正在补齐全部云端目标缓存...")
+        entries, failures = self._collect_cloud_cache(
+            settings, force=refresh, progress=lambda message: self.emit("cloud_log", message)
         )
+        root_key = self._cloud_options_cache_key({**settings, "project": ""})
+        projects = entries[root_key]["projects"]
+        target_project = settings.get("project", "").strip()
+        if target_project:
+            matched_project = next(
+                (value for value in projects if value.casefold() == target_project.casefold()), ""
+            )
+            if not matched_project:
+                raise OpsApiError(f'Ops 中没有找到部署专案“{target_project}”')
+            target_project = matched_project
+        key = self._cloud_options_cache_key({**settings, "project": target_project})
+        warnings = [f"{project}：{message}" for project, message in failures.items()]
+        if target_project in failures:
+            payload = {
+                "source": source, "request_id": settings.get("_options_request_id"),
+                "error": f"{target_project}：{failures[target_project]}；已有缓存保留，可刷新重试",
+            }
+        else:
+            payload = self._cloud_options_payload(settings, source, entries[key])
+            payload["cache_warnings"] = warnings
+        payload["cache_entries"] = entries
+        self.emit("cloud_options", payload)
+        for warning in warnings:
+            self.emit("cloud_log", f"云端缓存读取失败：{warning}")
         self.emit(
             "cloud_log",
-            f"API 已加载 {len(projects)} 个部署专案、{len(deploy_types)} 个服务类型、"
-            f"{len(regions)} 个云区节点。",
+            f"云端缓存未全部完成，{len(failures)} 个专案读取失败，已有缓存保留。" if failures
+            else f"已全量缓存 {len(projects)} 个云端专案的服务类型和云区节点。",
         )
         self.emit("cloud_status", "已登录")
 
@@ -7063,6 +8416,7 @@ class DeployTool(QMainWindow):
                 "project": options["project"],
                 "type": deploy_type,
                 "source": "package",
+                "request_id": settings.get("_options_request_id"),
             },
         )
         self.emit(
@@ -7753,11 +9107,7 @@ class DeployTool(QMainWindow):
         clipboard.setText(token)
 
 
-def shell_quote(value):
-    return "'" + value.replace("'", "'\"'\"'") + "'"
-
-
-class TaskCenterPanel(QWidget):
+class TaskCenterPanel(GlassBackground):
     """Compact task switcher shown in the main window's bottom dock."""
 
     expanded_changed = Signal(bool)
@@ -7780,7 +9130,7 @@ class TaskCenterPanel(QWidget):
         self.setObjectName("TaskCenterPanel")
         self.setStyleSheet(f"""
             QWidget#TaskCenterPanel {{
-                background: {COLORS['sidebar_bg']};
+                background: transparent;
                 border-top: 1px solid {COLORS['border']};
             }}
             QTreeWidget {{
@@ -7842,12 +9192,22 @@ class TaskCenterPanel(QWidget):
             f"color: {COLORS['text_secondary']}; font-size: 12px;"
         )
         header_layout.addWidget(self.counter_label)
+        self.copy_feedback = QLabel("")
+        self.copy_feedback.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 12px;"
+        )
+        header_layout.addWidget(self.copy_feedback)
+        self._copy_feedback_timer = QTimer(self)
+        self._copy_feedback_timer.setSingleShot(True)
+        self._copy_feedback_timer.timeout.connect(self.copy_feedback.clear)
         header_layout.addStretch()
 
         self.toggle_button = QToolButton()
         self.toggle_button.setObjectName("GhostBtn")
         self.toggle_button.setFixedSize(36, 34)
-        self.toggle_button.setArrowType(Qt.UpArrow)
+        self.toggle_button.setIcon(ui_icon("chevron-up", COLORS["text_primary"]))
+        self.toggle_button.setIconSize(QSize(22, 22))
+        self.toggle_button.setCursor(Qt.PointingHandCursor)
         self.toggle_button.setToolTip("展开任务中心")
         self.toggle_button.setAccessibleName("展开或收起任务中心")
         self.toggle_button.clicked.connect(self.toggle_expanded)
@@ -7881,6 +9241,13 @@ class TaskCenterPanel(QWidget):
         self.tree.setColumnWidth(6, 184)
         self.tree.itemClicked.connect(self._activate_item)
         self.tree.itemDoubleClicked.connect(self._activate_item)
+        copy_action = QAction("复制包号", self.tree)
+        copy_action.setShortcut(QKeySequence.Copy)
+        copy_action.setShortcutContext(Qt.WidgetShortcut)
+        copy_action.triggered.connect(
+            lambda: self._copy_package(self.tree.currentItem())
+        )
+        self.tree.addAction(copy_action)
         body_layout.addWidget(self.tree)
         layout.addWidget(self.body, 1)
 
@@ -7908,7 +9275,7 @@ class TaskCenterPanel(QWidget):
         cancel_button.setToolTip("停止当前正在运行的 Jenkins 任务")
         cancel_button.setAccessibleName(f"取消任务 {task.task_number}")
         cancel_button.setFixedSize(68, 30)
-        cancel_button.clicked.connect(lambda: self.manager.cancel_task(task))
+        cancel_button.clicked.connect(lambda: self.manager.toggle_task_execution(task))
         actions_layout.addWidget(cancel_button)
         remove_button = QPushButton("移除")
         remove_button.setObjectName("GhostBtn")
@@ -7919,6 +9286,7 @@ class TaskCenterPanel(QWidget):
         actions_layout.addWidget(remove_button)
         self.tree.setItemWidget(item, 6, actions)
         self._actions[task] = (cancel_button, remove_button)
+        apply_ui_icons(actions)
         self.update_task(task)
         self.select_task(task)
         if len(self._items) > 1:
@@ -7944,7 +9312,11 @@ class TaskCenterPanel(QWidget):
         item.setText(0, f"任务 {summary['number']}")
         descriptor = summary["package"] or summary["title"] or "等待配置"
         item.setText(1, descriptor)
-        item.setToolTip(1, descriptor)
+        item.setData(1, Qt.UserRole, summary["package"])
+        item.setToolTip(
+            1, f"{descriptor}\n点击复制包号，或选中任务后按 Ctrl+C"
+            if summary["package"] else descriptor
+        )
         item.setText(2, summary["target"] or "-")
         item.setToolTip(2, summary["target"] or "-")
         item.setText(3, summary["phase"] or "未开始")
@@ -7958,7 +9330,25 @@ class TaskCenterPanel(QWidget):
         item.setForeground(0, QBrush(color))
         item.setForeground(3, QBrush(color))
         cancel_button, remove_button = self._actions[task]
-        cancel_button.setEnabled(summary["can_cancel"])
+        restartable = summary["restartable"]
+        text = "继续" if restartable else ("停止中" if summary["is_cancelling"] else "停止")
+        button_style = "SuccessBtn" if restartable else "DangerGhostBtn"
+        if cancel_button.text() != text or cancel_button.objectName() != button_style:
+            cancel_button.setText(text)
+            cancel_button.setObjectName(button_style)
+            cancel_button.setIcon(
+                QIcon() if summary["is_cancelling"] else
+                ui_icon("play" if restartable else "square", COLORS["text_primary"])
+            )
+            cancel_button.style().unpolish(cancel_button)
+            cancel_button.style().polish(cancel_button)
+        cancel_button.setToolTip(
+            "使用上次任务的 Job、分支、参数和部署配置重新打包"
+            if restartable else "等待任务确认停止" if summary["is_cancelling"]
+            else "停止当前正在运行的 Jenkins 任务"
+        )
+        cancel_button.setAccessibleName(f"{'继续' if restartable else '停止'}任务 {task.task_number}")
+        cancel_button.setEnabled(summary["can_resume"] if restartable else summary["can_cancel"])
         remove_button.setEnabled(summary["can_remove"] and len(self._items) > 1)
         self._update_counter()
         if summary["state"] == "failed" and previous_state != "failed":
@@ -7976,10 +9366,20 @@ class TaskCenterPanel(QWidget):
         self.tree.setCurrentItem(item)
         self.tree.blockSignals(False)
 
-    def _activate_item(self, item, _column=0):
+    def _copy_package(self, item):
+        package = item.data(1, Qt.UserRole) if item is not None else ""
+        if not package:
+            return
+        QApplication.clipboard().setText(package)
+        self.copy_feedback.setText("已复制包号")
+        self._copy_feedback_timer.start(2500)
+
+    def _activate_item(self, item, column=0):
         for task, candidate in self._items.items():
             if candidate is item:
                 self.manager.activate_task(task)
+                if column == 1:
+                    self._copy_package(item)
                 return
 
     def _update_counter(self):
@@ -8007,13 +9407,73 @@ class TaskCenterPanel(QWidget):
     def set_expanded(self, expanded):
         self._expanded = bool(expanded)
         self.body.setVisible(self._expanded)
-        self.toggle_button.setArrowType(Qt.DownArrow if self._expanded else Qt.UpArrow)
+        self.toggle_button.setIcon(ui_icon(
+            "chevron-down" if self._expanded else "chevron-up", COLORS["text_primary"]
+        ))
         self.toggle_button.setToolTip("收起任务中心" if self._expanded else "展开任务中心")
         self.expanded_changed.emit(self._expanded)
 
     @property
     def expanded(self):
         return self._expanded
+
+
+class SingleApplicationInstance(QObject):
+    """Share one application per configuration directory, including EXE copies."""
+
+    activation_requested = Signal()
+
+    def __init__(self, config_dir, parent=None):
+        super().__init__(parent)
+        self.config_dir = Path(config_dir).resolve()
+        identity = os.path.normcase(str(self.config_dir)).encode("utf-8")
+        self.server_name = "DeployConsole-" + hashlib.sha256(identity).hexdigest()[:32]
+        self.lock = QLockFile(str(self.config_dir / "application.lock"))
+        # Long-running deployments must not lose the lock just because it is old.
+        self.lock.setStaleLockTime(0)
+        self.server = QLocalServer(self)
+        self.server.setSocketOptions(QLocalServer.UserAccessOption)
+        self.server.newConnection.connect(self._activate_existing_window)
+        self._owns_lock = False
+
+    def acquire(self, timeout_ms=5000):
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            if self.lock.tryLock(0):
+                self._owns_lock = True
+                # Only the lock owner may remove a socket left by a crashed process.
+                QLocalServer.removeServer(self.server_name)
+                if not self.server.listen(self.server_name):
+                    error = self.server.errorString()
+                    self.close()
+                    raise RuntimeError(f"无法创建应用启动通道：{error}")
+                return True
+            if self.lock.error() != QLockFile.LockFailedError:
+                raise RuntimeError("无法锁定应用配置目录，请检查目录权限。")
+
+            socket = QLocalSocket()
+            socket.connectToServer(self.server_name)
+            connected = socket.waitForConnected(100)
+            socket.abort()
+            if connected:
+                return False
+            if time.monotonic() >= deadline:
+                raise RuntimeError("应用已在运行或正在启动，请稍后从系统托盘打开。")
+            time.sleep(0.05)
+
+    def _activate_existing_window(self):
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            socket.close()
+            socket.deleteLater()
+            self.activation_requested.emit()
+
+    def close(self):
+        if self._owns_lock:
+            self.server.close()
+            self.lock.unlock()
+            self._owns_lock = False
 
 
 class ApplicationWindowManager(QMainWindow):
@@ -8028,6 +9488,8 @@ class ApplicationWindowManager(QMainWindow):
         self._windows = []
         self._next_task_number = 1
         self._closing = False
+        self._hidden_to_tray = False
+        self._restore_maximized = False
 
         self.setWindowTitle("Deploy Console 并行任务中心版")
         self.setWindowIcon(QIcon(str(resource_path("assets/deploy-console-parallel.png"))))
@@ -8050,6 +9512,7 @@ class ApplicationWindowManager(QMainWindow):
         self.task_dock.setWidget(self.task_center)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.task_dock)
         self._resize_task_center(False)
+        self._build_system_tray()
 
     @property
     def windows(self):
@@ -8103,6 +9566,15 @@ class ApplicationWindowManager(QMainWindow):
         self.activate_task(task)
         task.cancel_pipeline()
 
+    def toggle_task_execution(self, task):
+        if task not in self._windows:
+            return
+        if task.task_summary()["restartable"]:
+            self.activate_task(task)
+            task.resume_build()
+        else:
+            self.cancel_task(task)
+
     def remove_task(self, task):
         if task not in self._windows:
             return
@@ -8153,10 +9625,73 @@ class ApplicationWindowManager(QMainWindow):
         self.target_coordinator.release_all(window)
         self.batch_coordinator.release_all(window)
 
-    def closeEvent(self, event):
+    def _build_system_tray(self):
+        self.tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        self.tray_icon = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray_icon.setToolTip("Deploy Console 并行任务中心版")
+
+        tray_menu = QMenu(self)
+        show_action = QAction("打开主窗口", self)
+        show_action.triggered.connect(self.restore_from_tray)
+        tray_menu.addAction(show_action)
+        tray_menu.setDefaultAction(show_action)
+        tray_menu.addSeparator()
+        quit_action = QAction("退出应用", self)
+        quit_action.triggered.connect(self.request_exit)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_icon_activated)
+        self.app.aboutToQuit.connect(self.tray_icon.hide)
+        if self.tray_available:
+            self.tray_icon.show()
+
+    def hide_to_tray(self):
+        """Hide the window while keeping builds and deployments running."""
+        if self._closing:
+            return
+        self._restore_maximized = self.isMaximized()
+        self._hidden_to_tray = self.tray_available
+        if self.tray_available:
+            self.hide()
+        else:
+            self.showMinimized()
+
+    def restore_from_tray(self):
+        """Restore and focus the main window from the notification area."""
+        if self._closing:
+            return
+        self._hidden_to_tray = False
+        if self._restore_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_icon_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restore_from_tray()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange and not self.isMinimized():
+            self._hidden_to_tray = False
+        super().changeEvent(event)
+
+    def request_exit(self):
+        """Exit only when all task work has finished.
+
+        The native title-bar X is reserved for minimizing.  This explicit
+        action keeps a recoverable exit path for users who really want to
+        terminate the process.
+        """
         active = [task for task in self._windows if task.has_active_work()]
         if active:
             task = active[0]
+            self.restore_from_tray()
             self.activate_task(task)
             self.task_center.set_expanded(True)
             task.message_overlay.show_message(
@@ -8165,12 +9700,44 @@ class ApplicationWindowManager(QMainWindow):
                 "请先取消并等待状态结束后再退出软件。",
                 kind="error",
             )
-            event.ignore()
-            return
+            return False
         self._closing = True
+        self.tray_icon.hide()
+        self.close()
+        self.app.quit()
+        return True
+
+    def closeEvent(self, event):
+        if not self._closing:
+            event.ignore()
+            self.hide_to_tray()
+            return
         for task in tuple(self._windows):
             task.shutdown_resources()
         event.accept()
+
+
+def run_application():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Deploy Console 并行任务中心版")
+    instance = SingleApplicationInstance(CONFIG_DIR, app)
+    try:
+        try:
+            if not instance.acquire():
+                return 0
+        except (OSError, RuntimeError) as exc:
+            QMessageBox.warning(None, "无法启动 Deploy Console", str(exc))
+            return 1
+        app.setQuitOnLastWindowClosed(False)
+        app.setWindowIcon(QIcon(str(resource_path("assets/deploy-console-parallel.png"))))
+        app.setStyleSheet(GLOBAL_QSS)
+        app.setFont(QFont(FONT_FAMILY, 10))
+        manager = ApplicationWindowManager(app)
+        instance.activation_requested.connect(manager.restore_from_tray)
+        manager.create_window()
+        return app.exec()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":
@@ -8193,11 +9760,4 @@ if __name__ == "__main__":
         backend = "edge" if sys.platform == "win32" else "chrome"
         print(f"selenium backend: {backend}")
     else:
-        app = QApplication(sys.argv)
-        app.setApplicationName("Deploy Console 并行任务中心版")
-        app.setWindowIcon(QIcon(str(resource_path("assets/deploy-console-parallel.png"))))
-        app.setStyleSheet(GLOBAL_QSS)
-        app.setFont(QFont(FONT_FAMILY, 10))
-        manager = ApplicationWindowManager(app)
-        manager.create_window()
-        sys.exit(app.exec())
+        sys.exit(run_application())

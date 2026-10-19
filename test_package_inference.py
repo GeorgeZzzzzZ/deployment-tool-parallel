@@ -56,6 +56,7 @@ class PackageInferenceTests(unittest.TestCase):
         store = SimpleNamespace(data={}, save=Mock())
         tool = SimpleNamespace(
             package_input=Mock(text=Mock(return_value=package)),
+            cloud_package=Mock(),
             message_overlay=SimpleNamespace(show_message=Mock()),
             _set_env_var=Mock(),
             env_dirty=False,
@@ -73,6 +74,7 @@ class PackageInferenceTests(unittest.TestCase):
             _set_cloud_target_loading=Mock(),
             run_thread=Mock(),
             _load_cloud_package_target_options=Mock(),
+            _queue_cloud_options=Mock(),
         )
 
         DeployTool.apply_deployment_targets_from_package(tool)
@@ -82,7 +84,9 @@ class PackageInferenceTests(unittest.TestCase):
         self.assertEqual(values["yaml_file"], "etmmobile.yaml")
         self.assertEqual(values["apply_command"], "kubectl apply -f etmmobile.yaml")
         self.assertTrue(tool.env_dirty)
-        tool.run_thread.assert_called_once()
+        tool._queue_cloud_options.assert_called_once()
+        self.assertEqual(tool._queue_cloud_options.call_args.kwargs["package"], package)
+        tool.cloud_package.setText.assert_called_once_with(package)
         self.assertEqual(store.data["last_package"], package)
 
     def test_ssh_variant_suffix_does_not_change_product(self):

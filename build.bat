@@ -6,15 +6,15 @@ cd /d "%~dp0"
 python -m pip install -r requirements.txt
 if errorlevel 1 exit /b 1
 
-python -m PyInstaller --noconfirm --clean DeployConsole.spec
+python -m PyInstaller --noconfirm --clean --distpath release DeployConsole.spec
 if errorlevel 1 exit /b 1
 
-start "" /wait dist\DeployConsoleBatchSafe.exe --self-test-credentials
+start "" /wait release\DeployConsoleBatchSafe.exe --self-test-credentials
 if errorlevel 1 exit /b 1
 
-start "" /wait dist\DeployConsoleBatchSafe.exe --self-test-selenium
+start "" /wait release\DeployConsoleBatchSafe.exe --self-test-selenium
 if errorlevel 1 exit /b 1
 
 echo.
-echo Build complete: dist\DeployConsoleBatchSafe.exe
+echo Build complete: release\DeployConsoleBatchSafe.exe
 endlocal
