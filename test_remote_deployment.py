@@ -34,7 +34,7 @@ def load_deployment_code():
         "PipelineCancelled", "RemoteCommandInterrupted", "BatchReassembled",
         "BatchDeploymentCoordinator", "exception_message", "ANSI_ESCAPE_RE",
         "TRANSFER_PROGRESS_RE", "clean_remote_output_line", "_transfer_bytes",
-        "parse_transfer_progress", "format_transfer_bytes",
+        "parse_transfer_progress", "format_transfer_bytes", "DockerImageProgress",
     }
     methods = {
         "_execute_deploy_batch", "_remote_exec", "_quiet_remote_status",
@@ -316,6 +316,85 @@ class RemotePtyTests(unittest.TestCase):
         self.assertEqual((self.root / "received").read_text(), "etmbackend:new\netmfrontend:new\n")
         self.assertEqual((self.root / "applied").read_text(), "appliedapplied")
         self.assertEqual(len(self.tool.updated), 2)
+        self.assert_clean()
+
+    def test_transfer_progress_only_advances_the_current_image_owner(self):
+        digest = "new: digest: sha256:" + "a" * 64 + " size: 1234"
+        lines = []
+        for service, amount in (("backend", 50), ("frontend", 25)):
+            lines.extend([
+                f"处理镜像: etm{service}:new",
+                f"new: Pulling from industry/etm{service}",
+                f"a: Downloading {amount}MB/100MB",
+                f"The push refers to repository [registry.example/industry/etm{service}]",
+                "a: Pushing 50MB/100MB", digest,
+            ])
+        (self.root / "transfer.sh").write_text(
+            "\n".join("printf '%s\\n' " + shell_quote(line) for line in lines)
+            + "\ntouch ../completed\n"
+        )
+        follower = DeploymentHarness()
+        self.entries[1]["owner"] = follower
+        snapshots = []
+
+        def capture(target, payload):
+            if target == "deploy_progress" and "拉取镜像：约" in payload[1]:
+                snapshots.append(tuple(
+                    [value for name, value in owner.events if name == "deploy_progress"][-1]
+                    for owner in (self.tool, follower)
+                ))
+
+        self.tool.on_event = follower.on_event = capture
+        self.run_batch()
+        self.assertTrue(any(first[0] == 30 and second == (15, "等待拉取镜像...")
+                            for first, second in snapshots))
+        self.assertTrue(any(first[0] == 78 and second[0] == 22 for first, second in snapshots))
+        for owner in (self.tool, follower):
+            updates = [payload for target, payload in owner.events if target == "deploy_progress"]
+            values = [percent for percent, _text in updates]
+            self.assertEqual(values, sorted(values))
+            self.assertTrue(any(percent == 78 and "已确认" in text for percent, text in updates))
+            self.assertEqual(updates[-1], (100, "合并部署完成"))
+        self.assert_clean()
+
+    def test_cached_image_keeps_its_progress_while_other_image_transfers(self):
+        self.script()
+        follower = DeploymentHarness()
+        self.entries[1]["owner"] = follower
+        with patch.object(self.tool, "_remote_command_succeeded",
+                          side_effect=lambda _client, command: "etmbackend:new" in command):
+            self.run_batch()
+        updates = [payload for target, payload in self.tool.events if target == "deploy_progress"]
+        self.assertIn((78, "目标镜像已存在，等待部署..."), updates)
+        self.assertEqual([value for value, _text in updates], sorted(value for value, _text in updates))
+        self.assertFalse(any("拉取" in text for _percent, text in updates))
+        self.assertEqual((self.root / "received").read_text(), "etmfrontend:new\n")
+        follower_updates = [payload for target, payload in follower.events if target == "deploy_progress"]
+        self.assertIn((15, "等待拉取镜像..."), follower_updates)
+        self.assertIn((78, "目标镜像已确认，等待部署..."), follower_updates)
+        self.assert_clean()
+
+    def test_serial_script_finishes_pull_tag_push_before_the_next_image(self):
+        (self.root / "transfer.sh").write_text(
+            "docker() {\n"
+            "  printf '%s %s start\\n' \"$1\" \"$2\" >> ../order\n"
+            "  sleep 0.03\n"
+            "  printf '%s %s end\\n' \"$1\" \"$2\" >> ../order\n"
+            "}\n"
+            "while IFS= read -r image; do\n"
+            "  docker pull \"source/$image\"\n"
+            "  docker tag \"source/$image\" \"target/$image\"\n"
+            "  docker push \"target/$image\"\n"
+            "done < images.txt\n"
+            "touch ../completed\n"
+        )
+        self.run_batch()
+        expected = [f"{action} {repository}/etm{service}:new {state}"
+                    for service in ("backend", "frontend")
+                    for action, repository in (("pull", "source"), ("tag", "source"), ("push", "target"))
+                    for state in ("start", "end")]
+        self.assertEqual((self.root / "order").read_text().splitlines(), expected)
+        self.assertEqual(self.client.transfer_count, 1)
         self.assert_clean()
 
     def test_nonzero_child_exit_stops_before_probe_or_yaml_apply(self):

@@ -70,6 +70,7 @@ from core import (
 from ops_api import (
     OpsApiClient, OpsApiError, OpsSubmissionUnknown, service_type_id, service_type_label,
 )
+from package_trace import JenkinsHistorySource, format_trace_match, parse_packages, trace_packages, trace_result_fields
 
 # ── Color Palette (Glassmorphism / Frosted Glass / Modern SaaS) ─────
 COLORS = {
@@ -337,6 +338,122 @@ def format_transfer_bytes(value):
     if value < 1024 ** 3:
         return f"{value / 1024 ** 2:.1f} MB"
     return f"{value / 1024 ** 3:.2f} GB"
+
+
+class DockerImageProgress:
+    """Associate serial Docker output with one image and aggregate its layers."""
+
+    def __init__(self, images, progress_range):
+        self.states = {image: {"pull": {}, "push": {}, "percent": progress_range[0],
+                               "ratios": {}, "last": None, "done": False}
+                       for image in images}
+        self.start, self.end = progress_range
+        self.midpoint = self.start + (self.end - self.start) // 2
+        self.current_image = next(iter(self.states)) if len(self.states) == 1 else ""
+        self.phase = "pull"
+        self.push_repository = ""
+
+    def _resolve(self, reference):
+        candidates = [image for image in self.states
+                      if image == reference or image.endswith("/" + reference)]
+        if not candidates:
+            candidates = [image for image in self.states
+                          if image.rsplit("/", 1)[-1] == reference.rsplit("/", 1)[-1]]
+        return candidates[0] if len(candidates) == 1 else ""
+
+    def _update(self, confirmed=False):
+        if not self.current_image:
+            return None
+        state = self.states[self.current_image]
+        if state["done"] and not confirmed:
+            return None
+        start, end = ((self.start, self.midpoint) if self.phase == "pull"
+                      else (self.midpoint, self.end))
+        if confirmed:
+            ratio = 100
+            status = ("镜像已拉取，等待推送..." if self.phase == "pull"
+                      else "镜像已推送，等待目标校验与部署...")
+            if self.phase == "push":
+                state["done"] = True
+        else:
+            layers = state[self.phase]
+            pending = [layer for layer in layers.values() if not layer.get("cached")]
+            known = [layer["total"] for layer in pending if layer["total"] > 0]
+            # Unannounced layer sizes are estimated from known layers. A full
+            # progress bar still requires Docker's pull status or push receipt.
+            average = sum(known) / len(known) if known else 1
+            total = sum(layer["total"] or average for layer in pending)
+            current = sum((layer["total"] or average) if layer["done"]
+                          else layer["current"] for layer in pending)
+            fraction = current / total if total else (1 if layers else 0)
+            ratio = min(99, int(max(0, fraction) * 100))
+            ratio = max(state["ratios"].get(self.phase, 0), ratio)
+            action = "拉取" if self.phase == "pull" else "推送"
+            status = f"正在{action}镜像：约 {ratio}%（多层汇总）"
+        state["ratios"][self.phase] = ratio
+        state["percent"] = max(state["percent"], start + int((end - start) * ratio / 100))
+        update = (self.current_image, state["percent"], status)
+        if state["last"] == update:
+            return None
+        state["last"] = update
+        return update
+
+    def feed(self, line):
+        line = re.sub(r"^--->\s+", "", line)
+        marker = re.match(r"^处理镜像[:：]\s*(\S+)$", line)
+        pull = re.match(r"^(\S+): Pulling from (\S+)$", line)
+        if marker or pull:
+            reference = marker[1] if marker else pull[2] + ":" + pull[1]
+            self.current_image = self._resolve(reference)
+            self.phase = "pull"
+            self.push_repository = ""
+            return self._update()
+        push = re.match(r"^The push refers to repository \[([^\]]+)\]$", line)
+        if push:
+            self.push_repository = push[1]
+            candidates = [image for image in self.states if image.rsplit(":", 1)[0] == push[1]]
+            if self.current_image not in candidates:
+                self.current_image = candidates[0] if len(candidates) == 1 else ""
+            self.phase = "push"
+            return self._update()
+        receipt = re.match(r"^([^\s:]+): digest: sha256:[a-fA-F0-9]{64}\s+size:\s*\d+", line)
+        if receipt and self.push_repository:
+            image = self.push_repository + ":" + receipt[1]
+            if image in self.states:
+                self.current_image, self.phase = image, "push"
+                return self._update(confirmed=True)
+        pulled = re.match(r"^Status: (?:Downloaded newer image|Image is up to date) for (\S+)$", line)
+        if pulled:
+            self.current_image, self.phase = self._resolve(pulled[1]), "pull"
+            return self._update(confirmed=True)
+        layer_line = re.match(
+            r"^([\w.-]+): (Pulling fs layer|Waiting|Downloading|Extracting|Download complete|"
+            r"Pull complete|Already exists|Preparing|Pushing|Pushed|Layer already exists|Mounted from)\b",
+            line,
+        )
+        if not layer_line or not self.current_image:
+            return None
+        state = self.states[self.current_image]
+        layer = state[self.phase].setdefault(layer_line[1], {"current": 0, "total": 0, "done": False})
+        action = layer_line[2]
+        transfer = parse_transfer_progress(line)
+        if transfer and action in ("Downloading", "Pushing"):
+            current, total = transfer
+            layer.update(current=min(current, total), total=total)
+        elif action in ("Download complete", "Pull complete", "Extracting", "Pushed"):
+            layer["done"] = True
+        elif action in ("Already exists", "Layer already exists", "Mounted from"):
+            layer.update(done=True, cached=True)
+        return self._update()
+
+    def heartbeat(self, elapsed):
+        if not self.current_image:
+            return None
+        state = self.states[self.current_image]
+        if not state["last"] or state["done"]:
+            return None
+        return (self.current_image, state["percent"],
+                f"{state['last'][2]}；等待远端输出，命令已运行 {elapsed} 秒")
 
 
 def connect_ssh_client(client, data):
@@ -1363,8 +1480,8 @@ QMainWindow {{
     background-color: {COLORS['bg']};
 }}
 QWidget#CentralWidget,
-QWidget#JenkinsPage, QWidget#DeployPage, QWidget#CloudDeployPage,
-QWidget#JenkinsScrollContent, QWidget#CloudDeployScrollContent,
+QWidget#JenkinsPage, QWidget#DeployPage, QWidget#CloudDeployPage, QWidget#PackageTracePage,
+QWidget#JenkinsScrollContent, QWidget#CloudDeployScrollContent, QWidget#PackageTraceScrollContent,
 QWidget#DeployScrollContent, QStackedWidget#TaskWorkspaceStack {{
     background: transparent;
 }}
@@ -2825,6 +2942,7 @@ class DeployTool(QMainWindow):
     sig_branch_choices = Signal(object)
     sig_branch_refresh_error = Signal(object)
     sig_build_summary = Signal(object)
+    sig_package_trace = Signal(object)
 
     def __init__(
         self, store=None, window_manager=None, task_number=1, embedded=False
@@ -2876,6 +2994,8 @@ class DeployTool(QMainWindow):
         self._summary_runs = {}
         self._running_summary_selection = None
         self._running_summary_build_url = ""
+        self._trace_request = None
+        self._trace_report = None
         self.dashboard_drivers = []
         self.cloud_driver = None
         self.ops_api = None
@@ -2962,6 +3082,7 @@ class DeployTool(QMainWindow):
         self.sig_branch_choices.connect(self._on_branch_choices)
         self.sig_branch_refresh_error.connect(self._on_branch_refresh_error)
         self.sig_build_summary.connect(self._on_build_summary)
+        self.sig_package_trace.connect(self._on_package_trace)
 
     # ── Emit helpers (thread-safe via signals) ─────────────────────
     def emit(self, target, payload=None):
@@ -3791,7 +3912,11 @@ class DeployTool(QMainWindow):
         cloud_page.setObjectName("CloudDeployPage")
         self.tab_widget.addTab(cloud_page, "  云端部署  ")
         self._build_cloud_deploy_tab(cloud_page)
-        for index, name in enumerate(("file-archive", "send", "cloud")):
+        trace_page = QWidget()
+        trace_page.setObjectName("PackageTracePage")
+        self.tab_widget.addTab(trace_page, "  包号溯源  ")
+        self._build_package_trace_tab(trace_page)
+        for index, name in enumerate(("file-archive", "send", "cloud", "file-archive")):
             self.tab_widget.setTabIcon(index, ui_icon(name))
         self.tab_widget.setIconSize(QSize(18, 18))
         self._apply_tab_order(self.store.data.get("tab_order", []))
@@ -4315,6 +4440,184 @@ class DeployTool(QMainWindow):
         self.build_log.setReadOnly(True)
         self.build_log.setMinimumHeight(120)
         log_card.content_layout().addWidget(self.build_log)
+
+    def _build_package_trace_tab(self, page):
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        content_widget = QWidget()
+        content_widget.setObjectName("PackageTraceScrollContent")
+        content_widget.setMinimumHeight(620)
+        scroll.setWidget(content_widget)
+        outer.addWidget(scroll)
+        layout = QVBoxLayout(content_widget)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
+        card = CardWidget("包号溯源")
+        layout.addWidget(card)
+        content = card.content_layout()
+        hint = QLabel("每行一个包号，按产品和服务筛选任务，支持后端、前端和 APP 包。")
+        hint.setWordWrap(True)
+        content.addWidget(hint)
+        self.trace_input = QPlainTextEdit()
+        self.trace_input.setAccessibleName("待溯源包号")
+        self.trace_input.setPlaceholderText(
+            "pqmbackend-5.2.0:5.2.0.1001.11047\npqmfrontend-5.2.0:4.0.2.1412\n"
+            "pqmmobile-bmgd-2.1.0:4.0.0.1000.10007"
+        )
+        self.trace_input.setFixedHeight(74)
+        content.addWidget(self.trace_input)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        self.trace_search_button = QPushButton("查询来源")
+        self.trace_search_button.setObjectName("PrimaryBtn")
+        self.trace_search_button.clicked.connect(self._start_package_trace)
+        self.trace_cancel_button = QPushButton("取消查询")
+        self.trace_cancel_button.setObjectName("DangerBtn")
+        self.trace_cancel_button.setEnabled(False)
+        self.trace_cancel_button.clicked.connect(self._cancel_package_trace)
+        self.trace_copy_button = QPushButton("复制结果")
+        self.trace_copy_button.clicked.connect(self._copy_package_trace)
+        self.trace_open_button = QPushButton("查看构建")
+        self.trace_open_button.clicked.connect(self._open_package_trace)
+        for widget in (self.trace_open_button, self.trace_cancel_button,
+                       self.trace_copy_button, self.trace_search_button):
+            controls.addWidget(widget)
+        content.addLayout(controls)
+        self.trace_status = QLabel("等待查询。")
+        self.trace_status.setToolTip("打包时间使用 Jenkins 构建记录时间（UTC+8）。")
+        self.trace_status.setTextFormat(Qt.PlainText)
+        self.trace_status.setWordWrap(True)
+        layout.addWidget(self.trace_status)
+        splitter = QSplitter(Qt.Vertical)
+        layout.addWidget(splitter, 1)
+        self.trace_results = QTreeWidget()
+        self.trace_results.setRootIsDecorated(False)
+        self.trace_results.setHeaderLabels(["包号", "打包人", "打包分支", "打包时间", "代码仓库"])
+        self.trace_results.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.trace_results.setUniformRowHeights(True)
+        self.trace_results.header().setSectionResizeMode(QHeaderView.Interactive)
+        for index, width in enumerate((300, 120, 250, 175)):
+            self.trace_results.setColumnWidth(index, width)
+        self.trace_results.currentItemChanged.connect(self._show_package_trace_detail)
+        self.trace_results.itemDoubleClicked.connect(self._open_package_trace)
+        splitter.addWidget(self.trace_results)
+        self.trace_details = QPlainTextEdit()
+        self.trace_details.setReadOnly(True)
+        self.trace_details.setPlaceholderText("包号：\n打包人：\n打包分支：\n打包时间：\n代码仓库：")
+        splitter.addWidget(self.trace_details)
+        splitter.setSizes([260, 170])
+
+    def _set_package_trace_busy(self, busy):
+        for widget in (self.trace_input, self.trace_search_button):
+            widget.setEnabled(not busy)
+        self.trace_cancel_button.setEnabled(busy)
+
+    def _start_package_trace(self):
+        if self._trace_request is not None:
+            return
+        if self.jenkins is None or self._job_cache_loading:
+            self.trace_status.setText("请先在 Jenkins 页完成登录并加载任务，再查询包号。")
+            return
+        try:
+            packages = parse_packages(self.trace_input.toPlainText())
+        except ValueError as exc:
+            self.trace_status.setText(str(exc))
+            return
+        request = {"client": self.jenkins, "cancel": threading.Event()}
+        self._trace_request = request
+        self._trace_report = None
+        self.trace_results.clear()
+        self.trace_details.clear()
+        self.trace_status.setToolTip("打包时间使用 Jenkins 构建记录时间（UTC+8）。")
+        self._set_package_trace_busy(True)
+        self.trace_status.setText("正在读取历史构建，旧包查询可能需要较长时间；可以随时取消。")
+
+        def send(kind, data):
+            self.sig_package_trace.emit({"request": request, "kind": kind, "data": data})
+
+        def query():
+            try:
+                source = JenkinsHistorySource(request["client"], request["cancel"])
+                report = trace_packages(source, packages,
+                                        progress=lambda value: send("progress", value),
+                                        on_match=lambda value: send("match", value))
+            except (RuntimeError, ValueError) as exc:
+                report = {"error": str(exc)}
+            except Exception:
+                # HTTP responses and console text may contain credentials.
+                report = {"error": "查询异常结束，请检查 Jenkins 连接后重试。"}
+            send("finished", report)
+
+        self.run_thread(query)
+
+    def _cancel_package_trace(self):
+        if self._trace_request:
+            self._trace_request["cancel"].set()
+            self.trace_cancel_button.setEnabled(False)
+            self.trace_status.setText("正在取消查询，等待当前读取结束；已找到的结果会保留。")
+
+    @Slot(object)
+    def _on_package_trace(self, event):
+        request = event["request"]
+        if request is not self._trace_request:
+            return
+        kind, data = event["kind"], event["data"]
+        if request["client"] is not self.jenkins:
+            request["cancel"].set()
+            if kind == "finished":
+                self._trace_request = None
+                self._set_package_trace_busy(False)
+                self.trace_results.clear()
+                self.trace_details.clear()
+                self.trace_status.setText("Jenkins 连接已切换，请重新查询。")
+            return
+        if kind == "progress":
+            if not request["cancel"].is_set():
+                self.trace_status.setText(data)
+        elif kind == "match":
+            item = QTreeWidgetItem(trace_result_fields(data))
+            item.setData(0, Qt.UserRole, data)
+            for index in range(item.columnCount()):
+                item.setToolTip(index, item.text(index))
+            self.trace_results.addTopLevelItem(item)
+            if not self.trace_results.currentItem():
+                self.trace_results.setCurrentItem(item)
+        elif kind == "finished":
+            self._trace_request = None
+            self._set_package_trace_busy(False)
+            self._trace_report = data
+            if data.get("error"):
+                self.trace_status.setText(data["error"])
+                return
+            state = "已取消" if data["cancelled"] else "查询完成" if data["complete"] else "查询结束（范围未查全）"
+            self.trace_status.setText(
+                f"{state}：检查 {data['jobs']} 个任务、{data['scanned']} 次构建，找到 {len(data['matches'])} 条记录。"
+            )
+            notes = []
+            if data["unmatched"]:
+                notes.append("本次范围内未找到产出或推送证据：\n" + "\n".join(data["unmatched"]))
+            notes.extend(data["warnings"])
+            if any(row["kind"] == "仅推送记录" for row in data["matches"]):
+                notes.append("部分记录只有镜像推送证据，打包来源尚未确认。")
+            self.trace_status.setToolTip("\n".join(notes) or "打包时间使用 Jenkins 构建记录时间（UTC+8）。")
+
+    def _show_package_trace_detail(self, current, _previous=None):
+        self.trace_details.setPlainText(format_trace_match(current.data(0, Qt.UserRole)) if current else "")
+
+    def _copy_package_trace(self):
+        rows = [self.trace_results.topLevelItem(index).data(0, Qt.UserRole)
+                for index in range(self.trace_results.topLevelItemCount())]
+        if rows:
+            QApplication.clipboard().setText("\n\n".join(format_trace_match(row) for row in rows))
+
+    def _open_package_trace(self, *_args):
+        item = self.trace_results.currentItem()
+        if item:
+            webbrowser.open(item.data(0, Qt.UserRole)["url"])
 
     # ── Deploy Tab ─────────────────────────────────────────────────
     def _build_deploy_tab(self, page):
@@ -7083,6 +7386,9 @@ class DeployTool(QMainWindow):
         on_phase=None,
         interrupt_allowed=None,
         on_interrupt_failed=None,
+        transfer_images=None,
+        on_progress=None,
+        on_image_progress=None,
     ):
         """Execute a remote command without flooding Qt with TTY redraws."""
         self.emit("deploy_log", "$ " + command)
@@ -7097,6 +7403,20 @@ class DeployTool(QMainWindow):
         command_started_at = time.monotonic()
         last_activity_at = command_started_at
         last_heartbeat_at = command_started_at
+        image_progress = DockerImageProgress(transfer_images, progress_range) if transfer_images and progress_range else None
+
+        def report_progress(percent, status):
+            if on_progress:
+                on_progress(percent, status)
+            else:
+                self.emit("deploy_progress", (percent, status))
+
+        def report_image_progress(update):
+            if update:
+                if on_image_progress:
+                    on_image_progress(*update)
+                else:
+                    report_progress(update[1], update[2])
 
         def consume(text, final=False):
             nonlocal pending, last_log_line, largest_total, last_progress
@@ -7113,6 +7433,8 @@ class DeployTool(QMainWindow):
                 line = clean_remote_output_line(raw_line)
                 if not line:
                     continue
+                if image_progress:
+                    report_image_progress(image_progress.feed(line))
                 lower_line = line.casefold()
                 next_phase = ""
                 if "the push refers to repository" in lower_line:
@@ -7134,9 +7456,12 @@ class DeployTool(QMainWindow):
                         status = "正在推送镜像到目标仓库..."
                     largest_total = 0
                     last_progress = transfer_range[0] - 1
-                    self.emit("deploy_progress", (transfer_range[0], status))
+                    if not image_progress:
+                        report_progress(transfer_range[0], status)
                 transfer = parse_transfer_progress(line)
                 if transfer and transfer_range:
+                    if image_progress:
+                        continue
                     current, total = transfer
                     if total >= largest_total:
                         largest_total = total
@@ -7150,13 +7475,10 @@ class DeployTool(QMainWindow):
                                 if transfer_phase == "push"
                                 else "拉取镜像"
                             )
-                            self.emit(
-                                "deploy_progress",
-                                (
-                                    overall,
-                                    f"正在{action}：{format_transfer_bytes(current)} / "
-                                    f"{format_transfer_bytes(total)}",
-                                ),
+                            report_progress(
+                                overall,
+                                f"正在{action}（当前层）：{format_transfer_bytes(current)} / "
+                                f"{format_transfer_bytes(total)}",
                             )
                     continue
                 if line != last_log_line:
@@ -7207,13 +7529,13 @@ class DeployTool(QMainWindow):
                 elapsed = int(now - command_started_at)
                 phase_text = "推送" if transfer_phase == "push" else "拉取与校验"
                 heartbeat_progress = max(progress_range[0], last_progress)
-                self.emit(
-                    "deploy_progress",
-                    (
+                if image_progress:
+                    report_image_progress(image_progress.heartbeat(elapsed))
+                else:
+                    report_progress(
                         heartbeat_progress,
                         f"镜像仍在{phase_text}，远端命令已运行 {elapsed} 秒...",
-                    ),
-                )
+                    )
             time.sleep(0.02)
         while stdout.channel.recv_ready():
             consume(decoder.decode(stdout.channel.recv(65536)))
@@ -7223,10 +7545,9 @@ class DeployTool(QMainWindow):
         code = stdout.channel.recv_exit_status()
         if code:
             raise RuntimeError(f"命令退出码 {code}：{command}")
-        if progress_range:
-            self.emit(
-                "deploy_progress",
-                (progress_range[1], "镜像搬运命令已结束，正在更新 YAML..."),
+        if progress_range and not image_progress:
+            report_progress(
+                progress_range[1], "镜像搬运命令已结束，正在校验目标镜像...",
             )
 
     @staticmethod
@@ -7471,6 +7792,7 @@ class DeployTool(QMainWindow):
                         client,
                         f"cd {shell_quote(workspace)} && {data['pull_command']}",
                         progress_range=(15, 78),
+                        transfer_images=[target_image],
                     )
                     self.emit(
                         "deploy_log",
@@ -7546,6 +7868,11 @@ class DeployTool(QMainWindow):
             for owner in owners:
                 owner.emit(target, payload)
 
+        def update_image_progress(image, percent, status):
+            for entry in active:
+                if entry.get("target_image") == image and not entry["owner"].cancel_event.is_set():
+                    entry["owner"].emit("deploy_progress", (percent, status))
+
         lock_keys = sorted({
             self._deployment_target_key("SSH 环境部署", entry["environment"])
             for entry in active
@@ -7584,8 +7911,10 @@ class DeployTool(QMainWindow):
                     entry["owner"].emit(
                         "deploy_log", f"目标仓库已有镜像，跳过搬运：{target_image}"
                     )
+                    entry["owner"].emit("deploy_progress", (78, "目标镜像已存在，等待部署..."))
                 else:
                     transfer_packages.append(package)
+                    entry["owner"].emit("deploy_progress", (15, "等待拉取镜像..."))
 
             if coordinator and batch_token and coordinator.should_join_before_transfer(
                 batch_token
@@ -7608,10 +7937,6 @@ class DeployTool(QMainWindow):
                     workspace = self._create_isolated_image_workspace(
                         sftp, data, transfer_packages
                     )
-                    broadcast(
-                        "deploy_progress",
-                        (15, f"本轮统一搬运 {len(transfer_packages)} 个镜像..."),
-                    )
                     pid_file = posixpath.join(
                         workspace, ".deploy-console-command.pgid"
                     )
@@ -7633,6 +7958,9 @@ class DeployTool(QMainWindow):
                         client,
                         managed_command,
                         progress_range=(15, 78),
+                        transfer_images=[entry["target_image"] for entry in active
+                                         if entry["package"] in transfer_packages],
+                        on_image_progress=update_image_progress,
                         interrupt_event=(
                             coordinator.interrupt_event(batch_token)
                             if coordinator and batch_token
@@ -7666,6 +7994,7 @@ class DeployTool(QMainWindow):
                                 "deploy_log",
                                 f"目标镜像已确认可见：{entry['target_image']}",
                             )
+                            entry["owner"].emit("deploy_progress", (78, "目标镜像已确认，等待部署..."))
                 finally:
                     self._remove_isolated_image_workspace(sftp, workspace)
             else:
@@ -9014,12 +9343,6 @@ class DeployTool(QMainWindow):
         webbrowser.open(url)
 
     def _open_dashboard_item(self, item):
-        By = importlib.import_module("selenium.webdriver.common.by").By
-        WebDriverWait = importlib.import_module("selenium.webdriver.support.ui").WebDriverWait
-        StaleElementReferenceException = importlib.import_module(
-            "selenium.common.exceptions"
-        ).StaleElementReferenceException
-
         self.emit("loading_start", "正在打开 Dashboard...")
         url = item.get("url", "").strip()
         namespace = str(item.get("namespace") or "").strip() or "etm"
@@ -9034,6 +9357,11 @@ class DeployTool(QMainWindow):
             return
         driver = None
         try:
+            By = importlib.import_module("selenium.webdriver.common.by").By
+            WebDriverWait = importlib.import_module("selenium.webdriver.support.ui").WebDriverWait
+            StaleElementReferenceException = importlib.import_module(
+                "selenium.common.exceptions"
+            ).StaleElementReferenceException
             driver = create_browser_driver()
             driver.get(url)
             wait = WebDriverWait(driver, 25)
@@ -9113,6 +9441,9 @@ class DeployTool(QMainWindow):
             message = exception_message(exc)
             if "stale element reference" in message.lower():
                 message = "Dashboard 页面持续刷新，自动登录重试超时"
+            elif "decompressing data" in message.lower():
+                message = "浏览器组件读取失败，程序文件可能在运行中被替换。请退出并重新打开应用，再重试 Dashboard。"
+            self.emit("deploy_log", f"Dashboard 自动登录失败：{message}")
             self.emit("dashboard_fallback", (item, f"浏览器自动化失败：{message}"))
         finally:
             self.emit("loading_stop", None)
@@ -9773,6 +10104,8 @@ if __name__ == "__main__":
             raise RuntimeError("cryptography.fernet self-test failed")
         print("cryptography.fernet: ok")
     elif "--self-test-selenium" in sys.argv:
+        for module in ("selenium.webdriver.common.by", "selenium.webdriver.support.ui", "selenium.common.exceptions"):
+            importlib.import_module(module)
         backend = "edge" if sys.platform == "win32" else "chrome"
         print(f"selenium backend: {backend}")
     else:

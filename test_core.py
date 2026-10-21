@@ -385,7 +385,7 @@ class CoreTests(unittest.TestCase):
             if call.args[0] == "deploy_progress"
         ]
         self.assertTrue(any("远端命令已运行 11 秒" in text for text in statuses))
-        self.assertEqual(statuses[-1], "镜像搬运命令已结束，正在更新 YAML...")
+        self.assertEqual(statuses[-1], "镜像搬运命令已结束，正在校验目标镜像...")
 
     @patch.object(DeployTool, "_terminate_remote_process_group")
     def test_remote_exec_interrupts_only_managed_command_group(self, terminate):

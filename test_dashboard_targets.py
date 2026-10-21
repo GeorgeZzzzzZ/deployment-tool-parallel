@@ -1,5 +1,6 @@
 import threading
 import unittest
+import zlib
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -7,6 +8,19 @@ from main import DeployTool
 
 
 class DashboardTargetTests(unittest.TestCase):
+    def test_browser_import_failure_is_reported_as_dashboard_failure(self):
+        tool = SimpleNamespace(emit=Mock())
+        item = {"name": "测试", "url": "https://dashboard.example", "token": "test-token"}
+        with patch("main.unprotect_secret", return_value="test-token"), patch(
+            "main.importlib.import_module", side_effect=zlib.error("Error -3 while decompressing data: incorrect header check")
+        ):
+            DeployTool._open_dashboard_item(tool, item)
+        events = tool.emit.call_args_list
+        self.assertTrue(any(call.args[0] == "dashboard_fallback" for call in events))
+        self.assertFalse(any(call.args[0] == "error" for call in events))
+        self.assertEqual(sum(call.args[0] == "loading_start" for call in events), 1)
+        self.assertEqual(sum(call.args[0] == "loading_stop" for call in events), 1)
+
     def test_pipeline_opens_the_final_package_product_without_changing_saved_config(self):
         dashboard = {"id": "shared", "name": "环境2", "url": "https://dashboard.example"}
         environment = {

@@ -49,7 +49,7 @@ class WorkspaceContextTests(unittest.TestCase):
     def test_drag_order_keeps_pages_icons_and_navigation_and_syncs_tasks(self):
         second = self.manager.create_window(self.task)
         self.task.tab_widget.tabBar().moveTab(2, 1)
-        expected = ["JenkinsPage", "CloudDeployPage", "DeployPage"]
+        expected = ["JenkinsPage", "CloudDeployPage", "DeployPage", "PackageTracePage"]
         self.assertTrue(self.task.tab_widget.isMovable())
         for task in (self.task, second):
             self.assertEqual(self.pages(task), expected)
@@ -66,10 +66,32 @@ class WorkspaceContextTests(unittest.TestCase):
 
     def test_malformed_saved_tab_order_keeps_all_pages(self):
         self.task._apply_tab_order(["unknown", "CloudDeployPage", "CloudDeployPage", None])
-        self.assertEqual(self.pages(self.task), ["CloudDeployPage", "JenkinsPage", "DeployPage"])
+        self.assertEqual(self.pages(self.task), ["CloudDeployPage", "JenkinsPage", "DeployPage", "PackageTracePage"])
         self.assertEqual(self.task.tab_widget.currentWidget().objectName(), "JenkinsPage")
         self.task._apply_tab_order("invalid")
-        self.assertEqual(self.task.tab_widget.count(), 3)
+        self.assertEqual(self.task.tab_widget.count(), 4)
+
+    def test_image_progress_keeps_other_tasks_waiting_and_maps_overall_progress(self):
+        tasks = [self.task, self.manager.create_window(self.task), self.manager.create_window(self.task)]
+        images = [f"registry.example/{name}backend:1" for name in ("etm", "pqm", "mms")]
+        for task in tasks:
+            task._task_runtime_active = True
+            task._task_state = "running"
+            task.build_running = task.active_deploy_after_build = True
+            task._on_deploy_progress(15, "等待拉取镜像...")
+        progress = main.DockerImageProgress(images, (15, 78))
+        for line in ("处理镜像: etmbackend:1", "a: Downloading 50MB/100MB"):
+            image, percent, text = progress.feed(line)
+            tasks[images.index(image)]._on_deploy_progress(percent, text)
+        self.app.processEvents()
+        self.assertEqual([task._task_progress for task in tasks], [75, 70, 70])
+        self.assertEqual([self.manager.task_center._items[task].text(4) for task in tasks],
+                         ["75%", "70%", "70%"])
+        self.assertIn("50%", tasks[0].deploy_progress_label.text())
+        self.assertTrue(all(task.deploy_progress_label.text() == "等待拉取镜像..." for task in tasks[1:]))
+        for task in tasks:
+            task.build_running = task.active_deploy_after_build = False
+            task._task_runtime_active = False
 
     def test_build_controls_stay_visible_while_scrolling_at_small_and_large_sizes(self):
         self.task.build_cloud_card.show()
