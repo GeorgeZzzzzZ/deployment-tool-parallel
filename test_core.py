@@ -573,7 +573,7 @@ class CoreTests(unittest.TestCase):
             "https://dashboard.172.16.2.47.nip.io/#/pod?namespace=etm",
         )
 
-    def test_windows_dashboard_login_opens_etm_pods(self):
+    def test_windows_dashboard_login_opens_pqm_pods(self):
         state = {"logged_in": False}
         token_input = Mock()
         token_input.is_displayed.return_value = True
@@ -620,6 +620,7 @@ class CoreTests(unittest.TestCase):
             "name": "环境3",
             "url": "https://dashboard.172.16.2.47.nip.io/",
             "token": "encrypted-token",
+            "namespace": "pqm",
         }
 
         with (
@@ -634,11 +635,11 @@ class CoreTests(unittest.TestCase):
             [call.args[0] for call in driver.get.call_args_list],
             [
                 "https://dashboard.172.16.2.47.nip.io/",
-                "https://dashboard.172.16.2.47.nip.io/#/pod?namespace=etm",
+                "https://dashboard.172.16.2.47.nip.io/#/pod?namespace=pqm",
             ],
         )
         self.assertEqual(tool.dashboard_drivers, [driver])
-        tool.emit.assert_any_call("dashboard_login_ok", "环境3")
+        tool.emit.assert_any_call("dashboard_login_ok", ("环境3", "pqm"))
 
     def test_dashboard_login_retries_stale_token_input_and_login_button(self):
         class StaleElementReferenceException(RuntimeError):
@@ -718,7 +719,7 @@ class CoreTests(unittest.TestCase):
 
         token_input.send_keys.assert_called_once_with("dashboard-token")
         login_button.click.assert_called_once_with()
-        tool.emit.assert_any_call("dashboard_login_ok", "环境3")
+        tool.emit.assert_any_call("dashboard_login_ok", ("环境3", "etm"))
 
     def test_dashboard_fallback_removes_webdriver_stacktrace(self):
         class BrowserError(RuntimeError):
@@ -803,10 +804,10 @@ class CoreTests(unittest.TestCase):
         tool = SimpleNamespace(message_overlay=message_overlay, deploy_log=Mock())
 
         with patch("main.sys.platform", "win32"):
-            DeployTool._on_dashboard_login_ok(tool, "环境3（宏阳鑫）")
+            DeployTool._on_dashboard_login_ok(tool, "环境3（宏阳鑫）", "pqm")
 
         tool.deploy_log.appendPlainText.assert_called_once_with(
-            "已自动登录并打开 etm Pods：环境3（宏阳鑫）"
+            "已自动登录并打开 pqm Pods：环境3（宏阳鑫）"
         )
         message_overlay.show_message.assert_not_called()
         information.assert_not_called()
@@ -1514,7 +1515,7 @@ class CoreTests(unittest.TestCase):
         dashboard_calls = [
             call
             for call in tool.emit.call_args_list
-            if call.args == ("open_dashboard_item", dashboard)
+            if call.args == ("open_dashboard_item", {**dashboard, "namespace": "etm"})
         ]
         self.assertEqual(len(dashboard_calls), 1)
         follower.emit.assert_not_called()
@@ -1739,6 +1740,28 @@ class CoreTests(unittest.TestCase):
             "http://jenkins/job/project", "GIT_BRANCH"
         )
         self.assertEqual(choices, ["origin/master", "origin/dev"])
+
+    def test_secondary_branch_refresh_uses_primary_choices_with_legacy_clients(self):
+        params = [
+            {"name": "GIT_BRANCH", "choices": ["origin/main", "origin/feature"]},
+            {"name": "GIT_BRANCH2", "type": "StringParameterDefinition"},
+        ]
+        for single_parameter_api in (False, True):
+            with self.subTest(single_parameter_api=single_parameter_api):
+                client = SimpleNamespace(get_parameters=Mock(return_value=params))
+                if single_parameter_api:
+                    client.get_git_parameter_choices = Mock(return_value=object())
+                tool = SimpleNamespace(emit=Mock())
+
+                DeployTool._load_branch_choices(
+                    tool, client, "https://jenkins.example/job/service/",
+                    "GIT_BRANCH2", ["service"], 1, 2,
+                )
+
+                tool.emit.assert_called_once_with("branch_choices", (
+                    client, ("service",), "GIT_BRANCH2", 1, 2,
+                    ["origin/main", "origin/feature"],
+                ))
 
     def test_job_list_requests_display_name(self):
         client = JenkinsClient("http://jenkins", "user", "token")

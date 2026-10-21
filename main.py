@@ -18,6 +18,7 @@ from ctypes import wintypes
 from functools import lru_cache
 from pathlib import Path
 from shlex import quote as shell_quote
+from urllib.parse import urlsplit
 
 import paramiko
 import requests
@@ -54,6 +55,7 @@ from core import (
     extract_job_project_code,
     extract_package_number,
     infer_cloud_deployment_config,
+    infer_package_target,
     infer_ssh_deployment_config,
     is_secondary_build_path,
     jenkins_job_api_url,
@@ -2807,7 +2809,7 @@ class DeployTool(QMainWindow):
     sig_remote_options = Signal(object)
     sig_remote_loading_done = Signal()
     sig_dashboard_fallback = Signal(object, str)
-    sig_dashboard_login_ok = Signal(str)
+    sig_dashboard_login_ok = Signal(str, str)
     sig_loading_start = Signal(str)
     sig_loading_stop = Signal()
     sig_jenkins_login_finished = Signal(bool, str)
@@ -2983,7 +2985,7 @@ class DeployTool(QMainWindow):
             "remote_options": lambda: self.sig_remote_options.emit(payload),
             "remote_loading_done": lambda: self.sig_remote_loading_done.emit(),
             "dashboard_fallback": lambda: self.sig_dashboard_fallback.emit(payload[0], payload[1]),
-            "dashboard_login_ok": lambda: self.sig_dashboard_login_ok.emit(payload),
+            "dashboard_login_ok": lambda: self.sig_dashboard_login_ok.emit(payload[0], payload[1]),
             "loading_start": lambda: self.sig_loading_start.emit(payload),
             "loading_stop": lambda: self.sig_loading_stop.emit(),
             "jenkins_login_finished": lambda: self.sig_jenkins_login_finished.emit(
@@ -3301,7 +3303,7 @@ class DeployTool(QMainWindow):
         self._copy_dashboard_token(item)
         url = item.get("url", "").strip()
         if sys.platform == "win32":
-            url = dashboard_pods_url(url)
+            url = dashboard_pods_url(url, item.get("namespace"))
         if url:
             webbrowser.open(url)
         QMessageBox.warning(
@@ -3310,10 +3312,10 @@ class DeployTool(QMainWindow):
             f"{reason}\n\n已打开 Dashboard 并复制 Token，请手工粘贴。",
         )
 
-    @Slot(str)
-    def _on_dashboard_login_ok(self, name):
+    @Slot(str, str)
+    def _on_dashboard_login_ok(self, name, namespace):
         message = (
-            f"已自动登录并打开 etm Pods：{name}"
+            f"已自动登录并打开 {namespace} Pods：{name}"
             if sys.platform == "win32"
             else f"已自动登录：{name}"
         )
@@ -5603,7 +5605,7 @@ class DeployTool(QMainWindow):
             if param.get("type") == "BooleanParameterDefinition":
                 default = str(default).lower()
             choices = param.get("choices") or []
-            if choices and default not in choices:
+            if name != "GIT_BRANCH2" and choices and default not in choices:
                 remote_name = f"origin/{default}"
                 default = remote_name if remote_name in choices else choices[0]
 
@@ -5790,6 +5792,8 @@ class DeployTool(QMainWindow):
     def _load_branch_choices(
         self, client, job_url, name, path, parameter_generation, request_id
     ):
+        # GIT_BRANCH2 is a free-text override backed by GIT_BRANCH's repository list.
+        source_name = "GIT_BRANCH" if name == "GIT_BRANCH2" else name
         try:
             fetch_choices = getattr(client, "get_git_parameter_choices", None)
             if fetch_choices is None:
@@ -5803,13 +5807,13 @@ class DeployTool(QMainWindow):
                     (
                         item
                         for item in refreshed or []
-                        if isinstance(item, dict) and item.get("name") == name
+                        if isinstance(item, dict) and item.get("name") == source_name
                     ),
                     {},
                 )
                 choices = match.get("choices") or []
             else:
-                choices = fetch_choices(job_url, name)
+                choices = fetch_choices(job_url, source_name)
             if isinstance(choices, str):
                 choices = [choices]
             else:
@@ -5828,7 +5832,7 @@ class DeployTool(QMainWindow):
                             (
                                 item
                                 for item in refreshed or []
-                                if isinstance(item, dict) and item.get("name") == name
+                                if isinstance(item, dict) and item.get("name") == source_name
                             ),
                             {},
                         )
@@ -5886,8 +5890,11 @@ class DeployTool(QMainWindow):
         widget = info[1]
         current = widget.currentText()
         widget.set_values(choices)
-        selected = self._preferred_branch_choice(current, choices)
-        if selected:
+        selected = (
+            current if name == "GIT_BRANCH2"
+            else self._preferred_branch_choice(current, choices)
+        )
+        if selected or name == "GIT_BRANCH2":
             widget.setCurrentText(selected)
         key = getattr(self, "_displayed_parameter_key", None)
         params = self._cached_parameters(key) if key else None
@@ -6274,13 +6281,21 @@ class DeployTool(QMainWindow):
 
     @staticmethod
     def _open_batch_dashboards(entries):
-        """Open each distinct Dashboard once from its owning task window."""
+        """Open each Dashboard/product pair once from its owning task window."""
         opened = set()
         for entry in entries:
             dashboard = entry.get("dashboard") or {}
             owner = entry.get("owner")
             identity = DeployTool._dashboard_identity(dashboard)
-            if owner is None or identity is None or identity in opened:
+            if owner is None or identity is None:
+                continue
+            if entry.get("package"):
+                dashboard = {
+                    **dashboard,
+                    "namespace": infer_package_target(entry["package"])["product"],
+                }
+            identity = (identity, dashboard.get("namespace") or "etm")
+            if identity in opened:
                 continue
             opened.add(identity)
             owner.emit("open_dashboard_item", dashboard)
@@ -6662,7 +6677,9 @@ class DeployTool(QMainWindow):
                     DeployTool._release_deployment_target(self, target_key)
                 self._raise_if_deploy_cancelled()
                 self.emit("build_status", "部署完成，正在打开 Dashboard...")
-                self.emit("open_dashboard_item", dashboard)
+                self.emit("open_dashboard_item", {
+                    **dashboard, "namespace": infer_package_target(package)["product"],
+                })
                 self.emit("build_status", "一键流程执行完成")
                 self.emit("info", f"打包、部署已完成：\n{package}")
         except PipelineCancelled as exc:
@@ -8993,7 +9010,7 @@ class DeployTool(QMainWindow):
             QMessageBox.warning(self, "Dashboard 地址为空", "当前 Dashboard 未配置地址")
             return
         if sys.platform == "win32":
-            url = dashboard_pods_url(url)
+            url = dashboard_pods_url(url, item.get("namespace"))
         webbrowser.open(url)
 
     def _open_dashboard_item(self, item):
@@ -9005,6 +9022,7 @@ class DeployTool(QMainWindow):
 
         self.emit("loading_start", "正在打开 Dashboard...")
         url = item.get("url", "").strip()
+        namespace = str(item.get("namespace") or "").strip() or "etm"
         if not url:
             self.emit("dashboard_fallback", (item, "Dashboard 地址为空"))
             self.emit("loading_stop", None)
@@ -9078,16 +9096,14 @@ class DeployTool(QMainWindow):
             wait.until(click_login_button)
             wait.until(lambda browser: not find_token_input(browser))
             if sys.platform == "win32":
-                pods_url = dashboard_pods_url(url)
+                pods_url = dashboard_pods_url(url, namespace)
                 driver.get(pods_url)
                 wait.until(
-                    lambda browser: (
-                        "#/pod" in (browser.current_url or "")
-                        and "namespace=etm" in (browser.current_url or "")
-                    )
+                    lambda browser: urlsplit(browser.current_url or "").fragment
+                    == urlsplit(pods_url).fragment
                 )
             self.dashboard_drivers.append(driver)
-            self.emit("dashboard_login_ok", item["name"])
+            self.emit("dashboard_login_ok", (item["name"], namespace))
         except Exception as exc:
             if driver is not None:
                 try:

@@ -206,6 +206,46 @@ class SelectionCacheTests(unittest.TestCase):
         self.select()
         self.assertEqual(self.tool.param_vars["GIT_BRANCH"][1].values(), ["origin/new"])
 
+    def test_secondary_branch_refresh_reuses_primary_choices_and_preserves_its_value(self):
+        params = copy.deepcopy(PARAMETERS) + [
+            {"name": "GIT_BRANCH2", "type": "StringParameterDefinition",
+             "defaultParameterValue": {"value": ""}},
+        ]
+        self.client.get_parameters.side_effect = lambda _, **kwargs: copy.deepcopy(params)
+        self.select()
+        self.drain()
+        choices = ["origin/main", "origin/f-case451-423-449", "origin/release"]
+        for current in ("f-case451-423-449", "", "custom-not-in-list"):
+            with self.subTest(current=current):
+                self.tool.param_vars["GIT_BRANCH2"][1].setCurrentText(current)
+                self.tool.param_vars["folderName"][1].setText("keep-me")
+                self.client.get_git_parameter_choices = Mock(
+                    side_effect=lambda _url, name: choices if name == "GIT_BRANCH" else []
+                )
+
+                self.tool.param_refresh_buttons["GIT_BRANCH2"].click()
+                self.drain()
+
+                branch2 = self.tool.param_vars["GIT_BRANCH2"][1]
+                self.assertEqual(branch2.values(), choices)
+                self.assertEqual(self.tool._get_param_value("GIT_BRANCH2"), current)
+                self.assertEqual(self.tool._get_param_value("GIT_BRANCH"), "origin/main")
+                self.assertEqual(self.tool.param_vars["folderName"][1].text(), "keep-me")
+                self.client.get_git_parameter_choices.assert_called_once_with(
+                    "https://jenkins.example/job/service/", "GIT_BRANCH"
+                )
+                self.assertTrue(self.tool.param_refresh_buttons["GIT_BRANCH2"].isEnabled())
+                self.assertEqual(self.tool.loading_count, 0)
+
+                # Saved build values must survive rebuilding controls from the refreshed cache.
+                self.store.data["jenkins"]["values"]["service"] = {"GIT_BRANCH2": current}
+                self.select("other")
+                self.drain()
+                self.select()
+                self.assertEqual(self.pending, [])
+                self.assertEqual(self.tool.param_vars["GIT_BRANCH2"][1].values(), choices)
+                self.assertEqual(self.tool._get_param_value("GIT_BRANCH2"), current)
+
     def test_password_defaults_are_not_added_to_metadata_cache(self):
         self.client.get_parameters.side_effect = None
         self.client.get_parameters.return_value = [

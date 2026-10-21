@@ -127,7 +127,7 @@ class UiRegressionTests(unittest.TestCase):
             self.task.message_overlay, "show_message"
         ) as overlay:
             self.task.sig_cloud_status_login_ok.emit("Rancher 示例状态页")
-            self.task.sig_dashboard_login_ok.emit("示例环境")
+            self.task.emit("dashboard_login_ok", ("示例环境", "pqm"))
             self.app.processEvents()
         information.assert_not_called()
         overlay.assert_not_called()
@@ -135,6 +135,8 @@ class UiRegressionTests(unittest.TestCase):
         self.assertEqual(self.task.cloud_status_login_state.text(), "已登录")
         self.assertIn("已打开并登录：Rancher 示例状态页", self.task.cloud_log.toPlainText())
         self.assertIn("示例环境", self.task.deploy_log.toPlainText())
+        if main.sys.platform == "win32":
+            self.assertIn("pqm Pods", self.task.deploy_log.toPlainText())
 
 
 class OpsBrowserLoginTests(unittest.TestCase):
