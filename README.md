@@ -4,12 +4,14 @@ Deploy Console 并行任务中心版是在原版之外独立安装和运行的�
 
 界面沿用迁移工具的深色渐变与雾面玻璃卡片，悬停过渡为 200ms，并尊重 Windows 减少动画设置。图标随程序离线打包，来源与许可见 `assets/lucide/LICENSE` 和 `assets/uiverse/SOURCE.md`。
 
+Windows、Linux 和 macOS 共用最新功能：Jenkins 自动登录、完整任务树缓存与搜索、仅打包开关、包号溯源、并行任务中心，以及按产品跳转 Dashboard Pods。各平台保留原生配置目录、凭据加密和浏览器后端。
+
 ## 底部可折叠任务中心
 
-- 软件只使用一个主窗口。点击标题栏右侧的“新建任务”或按 `Ctrl+N` 会在主窗口内增加独立任务工作区，不再打开新的系统窗口；当前为 SSH 模式时会自动继承目标环境。
+- 软件只使用一个主窗口。点击标题栏右侧的“新建任务”或按 `Ctrl+N`（macOS 为 `⌘N`） 会在主窗口内增加独立任务工作区，不再打开新的系统窗口；当前为 SSH 模式时会自动继承目标环境。
 - 同一用户配置目录只运行一份应用，重复双击程序会恢复已有主窗口，不再新增托盘图标；正常退出或异常结束后可重新启动。每次更新都必须先通过托盘菜单退出旧版；运行期间不能重命名或替换 EXE，否则延迟加载组件可能发生解压错误。
 - 底部任务中心收起时只显示运行数、失败数和任务总数；点击右侧箭头可展开任务列表。
-- 点击任务的包号可复制完整内容，也可选中任务后按 Ctrl+C；环境部署表单在可用高度不足时支持滚动。
+- 点击任务的包号可复制完整内容，也可选中任务后按 `Ctrl+C`（macOS 为 `⌘C`）；环境部署表单在可用高度不足时支持滚动。
 - 展开后会显示每个任务的包号或 Jenkins Job、目标环境、当前阶段、总体进度和耗时。点击任意任务行即可切换主工作区。
 - 任务行右侧的“停止”用于取消正在运行的 Jenkins 一键任务；等待确认期间显示禁用的“停止中”，确认取消且后台收尾完成后变为“继续”。点击“继续”会按上次启动时的 Job、分支、参数及部署配置重新打包，并重置进度、耗时和日志；不使用后来修改的表单值。仅打包/打包后部署开关也沿用原值，SSH 合批会重新登记。继续所需配置只保留在本次应用会话中。“移除”用于移除已结束或尚未开始的任务，任务中心至少保留一个工作区。
 - 新增第二个任务或任一任务失败时，任务中心会自动展开；成功、失败和取消状态同时使用文字与颜色表示。
@@ -18,7 +20,7 @@ Deploy Console 并行任务中心版是在原版之外独立安装和运行的�
 - 默认情况下，相同 SSH 目标或相同云端目标会自动进入安全队列，前一个部署结束后再继续，避免相互覆盖。
 - SSH 一键任务自动按可共享镜像搬运命令的目标环境合批：多个任务先并行打包，再由一次镜像搬运统一处理本批次包，随后逐个更新并应用对应 YAML。
 - 一个任务工作区同一时间只执行一个打包或部署操作；需要并发时必须新增任务，避免日志和状态相互覆盖。
-- 点击主窗口右上角“×”会隐藏到 Windows 系统托盘，后台任务不会中断；单击托盘图标即可恢复。需要真正退出时使用托盘菜单或“配置迁移 → 退出应用”，运行中的任务仍需先结束。
+- 点击主窗口右上角“×”会隐藏到系统托盘或 macOS 菜单栏；桌面不支持托盘时改为最小化，后台任务不会中断；单击托盘图标即可恢复。需要真正退出时使用托盘菜单或“配置迁移 → 退出应用”，运行中的任务仍需先结束。
 - 所有任务共享并行版配置对象，防止任务之间保存配置时相互覆盖。
 
 项目详细背景、架构、关键约束和开发注意事项见 [HANDOFF.md](HANDOFF.md)。新成员修改代码前必须先阅读该文档。
@@ -31,7 +33,7 @@ Deploy Console 并行任务中心版是在原版之外独立安装和运行的�
 - 通过 SSH 更新镜像清单和 Kubernetes YAML，并执行环境发布命令。
 - 管理多套部署环境及其关联的 Kubernetes Dashboard。
 - 双击环境名称时使用系统默认浏览器打开环境页面，同时复制已保存的环境密码并提示账号。
-- Windows 一键 SSH 部署后使用 Edge 自动登录 Dashboard，并按最终部署包的产品打开对应命名空间的 Pods 页面（如 PQM → `pqm`、ESC → `esc`、ETM → `etm`）；合并部署按环境和产品去重，同一产品前后端只打开一次。失败时回退为默认浏览器并复制 Token，保留本次目标命名空间。手动双击 Dashboard 地址或点击“自动登录”仍默认打开 `etm`。
+- 一键 SSH 部署后使用 Edge（Windows）或 Chrome/Chromium（Linux、macOS）自动登录 Dashboard，并按最终部署包的产品打开对应命名空间的 Pods 页面（如 PQM → `pqm`、ESC → `esc`、ETM → `etm`）；合并部署按环境和产品去重，同一产品前后端只打开一次。失败时回退为默认浏览器并复制 Token，保留本次目标命名空间。手动双击 Dashboard 地址或点击“自动登录”仍默认打开 `etm`。
 - 登录鼎捷 Ops 平台，选择部署专案、服务类型和云区节点后发布 Jenkins 构建包。
 - Ops 云端部署成功后自动打开 Rancher Pod 状态页，并使用已保存的账号密码登录。
 - Dashboard 与 Rancher 自动登录成功后只更新状态和日志，不再显示需要确认的成功提示框。
@@ -41,9 +43,9 @@ Deploy Console 并行任务中心版是在原版之外独立安装和运行的�
 
 ## 环境要求
 
-- Windows 10/11、macOS 13+ 或 Deepin 25 AMD64
+- Windows 10/11、macOS 13+，或 Linux 桌面（Ubuntu 24.04 / Deepin 25 AMD64）
 - Python 3.11/3.12（仅源码运行和本机打包需要）
-- Windows 使用 Microsoft Edge；macOS/Deepin 使用 Google Chrome 或 Chromium
+- Windows 使用 Microsoft Edge；macOS/Linux 使用 Google Chrome 或 Chromium
 - 可访问目标 Jenkins、SSH 环境、Dashboard 和 Ops 平台的网络
 
 安装依赖：
@@ -63,39 +65,40 @@ python main.py
 ```text
 Windows: %APPDATA%\BuildDeployToolParallel\config.json
 macOS:   ~/Library/Application Support/BuildDeployToolParallel/config.json
-Deepin:  ${XDG_CONFIG_HOME:-~/.config}/BuildDeployToolParallel/config.json
+Linux:   ${XDG_CONFIG_HOME:-~/.config}/BuildDeployToolParallel/config.json
 ```
 
 Windows 首次启动并行版时会只读复制原版 `%APPDATA%\BuildDeployTool\config.json`，之后仅保存到并行版目录。
 
-Windows 凭据使用 DPAPI 加密；macOS 和 Deepin 使用仅当前用户可读写的本地密钥文件加密，避免 Keychain 或桌面 Secret Service 未启动、未解锁时阻塞登录按钮。不同操作系统之间不能直接迁移已保存的密文凭据，需要重新输入密码和 Token。
+Windows 凭据使用 DPAPI 加密；macOS 和 Linux 使用仅当前用户可读写的本地密钥文件加密，避免 Keychain 或桌面 Secret Service 未启动、未解锁时阻塞登录按钮。不同操作系统之间不能直接迁移已保存的密文凭据，需要重新输入密码和 Token。
 
 ## 基本使用
 
 ### Jenkins 打包
 
-1. 首次使用时填写 Jenkins 地址、账号和密码或 API Token，然后点击“登录并加载”。每次登录先向 Jenkins 验证身份，成功并加载任务后显示“登录成功”，Windows 版才收起连接栏；失败保持展开并显示具体错误（如 HTTP 401、403 或连接异常），已有本地缓存不会被当作登录成功。
-2. Windows 版会在凭据完整时自动登录：身份验证通过后只读取任务树，已有任务树缓存则直接复用。构建参数和分支在首次点击具体任务时读取并缓存，之后点击、新建任务或重启均优先复用缓存；不会在启动时遍历所有任务预加载，也不会等待云端目标读取。
+1. 首次使用时填写 Jenkins 地址、账号和密码或 API Token，然后点击“登录并加载”。每次登录先向 Jenkins 验证身份，成功并加载任务后显示“登录成功”，三端均收起连接栏；失败保持展开并显示具体错误（如 HTTP 401、403 或连接异常），已有本地缓存不会被当作登录成功。
+2. 三端均会在凭据完整时自动登录：身份验证通过后只读取任务树，已有任务树缓存则直接复用。构建参数和分支在首次点击具体任务时读取并缓存，之后点击、新建任务或重启均优先复用缓存；不会在启动时遍历所有任务预加载，也不会等待云端目标读取。
 3. 点击搜索框右侧的刷新按钮只更新完整任务树，不受当前搜索结果限制，已有参数和云端目标缓存保留。分支使用参数旁的“刷新分支”更新，云端目标使用对应刷新按钮更新。缓存按平台地址和账号隔离，不会跨服务器误用。
-4. Windows 版可模糊搜索根任务下的二级模块，命中模块的全部子任务会保留在结果树中。
+4. 三端均可模糊搜索根任务下的二级模块，命中模块的全部子任务会保留在结果树中。
 5. 在任务树选择最终构建任务并设置构建参数；构建参数默认收起，保留可编辑的 `GIT_BRANCH`，修改或刷新分支不会展开其他参数。点击标题可展开全部参数；`GIT_BRANCH`/`GIT_BRANCH2` 旁的“刷新分支”可单独获取最新分支并更新缓存，不会重置其他已填写参数。`GIT_BRANCH2` 刷新时复用当前任务的 `GIT_BRANCH` 分支列表，保留自身已填写值，也可从下拉框搜索选择；留空时仍由二开打包流程使用 `GIT_BRANCH`。首次读取失败时，再次点击该任务可重试。
    云端部署目标配置可点击标题收起。“状态集”默认展开，打包前不加载历史记录；本工具发起打包并取得构建编号后，显示本次结果、实际分支、提交版本和 Changes 变更记录，构建中每 5 秒更新，完成后停止。切换模块或任务时只显示各自本次打包记录；排队取消且未取得编号时不显示其他构建。手动刷新和“在 Jenkins 查看”始终对应本次编号，记录仅保留在当前程序会话。
 6. 选择 `SSH 环境部署` 或 `云端部署`；关闭“打包后部署”开关时仅执行 Jenkins 打包。
 
-任务树中的目录可点击整行展开或收起，也可选中后按 `Enter`、`Space` 操作，不必精确点击左侧箭头。选择模块或具体服务时，Jenkins 页和云端部署页的部署专案自动切到对应模块；WEB/SERVICE 任务同时匹配前端/后端，APP 任务匹配对应的 mobile 专案及前端，例如 ETM 的 `2-APP` 对应 `etmmobile`。目标仍可手动修改，APP 任务可使用同系统的 mobile 专案，其他系统仍禁止混用。模块文件夹不加载构建参数。
+Jenkins 打包页与包号溯源页的任务树搜索框均不显示清除按钮，搜索内容由用户手动删除。任务树中的目录可点击整行展开或收起，也可选中后按 `Enter`、`Space` 操作，不必精确点击左侧箭头。选择模块或具体服务时，Jenkins 页和云端部署页的部署专案自动切到对应模块；WEB/SERVICE 任务同时匹配前端/后端，APP 任务匹配对应的 mobile 专案及前端，例如 ETM 的 `2-APP` 对应 `etmmobile`。目标仍可手动修改，APP 任务可使用同系统的 mobile 专案，其他系统仍禁止混用。模块文件夹不加载构建参数。
 7. 点击当前模式对应的执行按钮。
 
 Jenkins 任务路径和打包操作栏固定在右侧顶部，滚动配置、状态集和日志时仍可操作。顶部页签可按住拖动排序，顺序同步到其他任务并在重启后保留；自动跳转始终进入对应功能页。
 
 ### 包号溯源（第四个页签）
 
-1. 在 Jenkins 页完成登录，进入“包号溯源”，每行粘贴一个包号，最多 20 个；标准格式为 `镜像名:版本号`，例如 `pqmmobile-bmgd-2.1.0:4.0.0.1000.10007`，也兼容横杠连接平台版本和数字包版本的格式。可保留完整仓库路径，结果保留输入的包号格式。
-2. 自动按包号的产品和服务筛选任务：`backend → SERVICE`、`frontend → WEB`、`mobile / mobilefrontend → APP`。例如 `etmbackend` 只查 ETM 后端，`pqmmobile` 只查 PQM 的 APP，覆盖普通、云应用和二开任务；批量查询分别按每个包筛选。无需选择查询参数，内部保持每任务最近 500 次、每份日志最多 32 MB 的读取上限。
+1. 进入“包号溯源”，每行粘贴一个包号，最多 20 个，直接查询 Jenkins 构建来源。标准格式为 `镜像名:版本号`，例如 `pqmmobile-bmgd-2.1.0:4.0.0.1000.10007`，也兼容横杠连接平台版本和数字包版本的格式。可保留完整仓库路径，结果保留输入的包号格式。
+2. **Jenkins**：复用 Jenkins 页登录，默认自动按包号的产品和服务筛选任务：`backend → SERVICE`、`frontend → WEB`、`mobile / mobilefrontend → APP`。例如 `etmbackend` 只查 ETM 后端，`pqmmobile` 只查 PQM 的 APP，覆盖普通、云应用和二开任务；批量查询分别按每个包筛选。左侧任务树复用打包页的搜索和刷新缓存，右侧保留包号输入与查询结果。选中具体任务后只查该路径；左侧搜索框不显示清除按钮；手动删空搜索内容或再次点击已选任务即可取消选择，立即恢复按包号自动匹配。搜索后已选任务不在可见结果中时，也会取消路径限制。溯源选择与打包页当前任务相互独立。内部保持每任务最近 500 次、每份日志最多 32 MB 的读取上限。
 3. 点击“查询来源”。列表、详情和“复制结果”只包含五项：包号、打包人、打包分支、打包时间、代码仓库。可随时取消并保留已找到的记录；“查看构建”打开选中记录的 Jenkins 页面。
 4. 打包人读取该次构建的触发用户，缺失时尝试日志开头的用户记录，仍缺失则显示“未记录”。时间为 Jenkins 构建记录时间（UTC+8）；分支和仓库来自同次构建的 SCM / checkout 记录，多仓库用对应编号列出。仓库包含 `${CUSTOM_NAME}` 等变量时，只有同一提交、分支及地址格式对应的 checkout 记录才能替换为实际地址。
 5. 只有镜像推送证据时，除包号外的四项显示“未确认”。同一包号的多次构建全部保留；短包号可能对应不同镜像仓库，可通过“查看构建”核对。
+6. 历史构建通过任务的 `/api/json?tree=allBuilds[number,timestamp,result,building]{起始位置,结束位置}` 分页读取，再读取对应构建的 `consoleText` 和源码元数据。普通 `builds` 默认只返回最近 50 次；`allBuilds` 可以查询更早但仍被保留的构建，无法恢复已清理记录。包号末尾数字不是 Jenkins 构建编号，不能直接替代。
 
-查询仅使用只读接口，不触发构建、拉取或部署镜像，不保存原始构建日志。超过查询上限、日志读取失败或记录已被清理时可能查不到；状态行会说明是否查全，鼠标停留可查看原因，“未找到”不代表包不存在。按钮从左到右为“查看构建、取消查询、复制结果、查询来源”，查询按钮位于最右侧。
+查询仅使用只读接口，不触发构建、拉取或部署镜像，不保存原始构建日志。超过查询上限、日志读取失败或记录已被清理时可能查不到；状态行会说明是否查全，鼠标停留可查看原因，“未找到”不代表包不存在。按钮从左到右为“查看构建、取消查询、复制结果、查询来源”，整组按钮位于包号输入框下方靠右，查询按钮在最右侧。
 
 ### SSH 环境部署
 
@@ -115,7 +118,7 @@ SSH 密码认证最多等待 30 秒，以兼容认证响应较慢的目标环境
 
 一键 SSH 流程会以 Jenkins 最终产出的包号重新计算 YAML 目录、文件和应用命令，部署前先校验 YAML 中的镜像名。目标 Harbor 已存在完全相同的镜像时会跳过重复拉取和推送；同一环境的 Jenkins 构建可并行，但 SSH 镜像搬运和 YAML 发布会安全排队，避免共享镜像清单相互覆盖。
 
-SSH 一键任务开始后会自动登记批次，无需开关或再次确认。程序按 SSH 主机、端口、账号、镜像目录、镜像清单和拉取命令判断是否可合批，等待本批次所有已登记任务打包完成后自动生成一份多包镜像清单统一搬运。若新任务进入时上一批处于源镜像拉取阶段，软件会在当前工作区内询问：可继续当前轮，或安全终止受控镜像命令、等待新包完成后重新合批；推送、YAML 修改和 `kubectl apply` 阶段不会中断，只会进入下一轮。需要继续增加任务时，从标题栏点击“新建任务”或按 `Ctrl+N` 即可继承当前 SSH 环境。
+SSH 一键任务开始后会自动登记批次，无需开关或再次确认。程序按 SSH 主机、端口、账号、镜像目录、镜像清单和拉取命令判断是否可合批，等待本批次所有已登记任务打包完成后自动生成一份多包镜像清单统一搬运。若新任务进入时上一批处于源镜像拉取阶段，软件会在当前工作区内询问：可继续当前轮，或安全终止受控镜像命令、等待新包完成后重新合批；推送、YAML 修改和 `kubectl apply` 阶段不会中断，只会进入下一轮。需要继续增加任务时，从标题栏点击“新建任务”或按 `Ctrl+N`（macOS 为 `⌘N`） 即可继承当前 SSH 环境。
 
 合批搬运由关闭作业控制的 Shell 启动 `setsid`，再用 Shell `wait` 等待脚本完成并检查其退出码，兼容不支持 `setsid --wait` 的旧主机。脚本非零退出时停止后续镜像确认与 YAML 发布。搬运后的镜像探测会区分仓库返回未找到、认证/权限、DNS、网络、TLS 和 Docker CLI 错误，日志仅显示错误类别与退出码，超时保留最后一次诊断，不显示可能含凭据的原始响应。
 
@@ -145,6 +148,8 @@ python -m unittest test_core.py test_package_inference.py test_parallel_windows.
 
 部署等待与取消回归：`python -m unittest test_remote_deployment -v`。Windows 会通过已安装的 WSL `Ubuntu-24.04` 执行真实 PTY 检查；Linux 可直接运行。该检查只在本机临时目录执行测试 shell，验证成功、非零退出、进程组取消和合批隔离，不连接远程环境。测试文件按原样加载部署方法，WSL 无需安装 Qt 或 SSH 依赖。
 
+跨平台功能回归：`python -m unittest test_cross_platform test_jenkins_login test_dashboard_targets test_package_trace_ui -v`。覆盖自动登录、身份校验失败、缓存刷新、仅打包及溯源任务选择；macOS 分支模拟不替代真实 Mac 验收。
+
 ## 打包
 
 Windows：
@@ -161,7 +166,13 @@ macOS（必须在 Mac 上执行）：
 bash ./build-macos.sh
 ```
 
-Deepin 25：
+Linux（在目标发行版和 CPU 架构上执行）：
+
+```bash
+bash ./build-linux.sh
+```
+
+Deepin 25（保留原打包入口，复用 Linux 构建）：
 
 ```bash
 bash ./build-deepin.sh
@@ -172,8 +183,11 @@ bash ./build-deepin.sh
 ```text
 Windows: release/DeployConsoleBatchSafe.exe
 macOS:   dist/DeployConsoleParallel.app、dist/DeployConsoleParallel-macos.dmg
+Linux:   dist/DeployConsoleParallel、dist/DeployConsoleParallel-linux-<架构>.tar.gz
 Deepin:  dist/DeployConsoleParallel、dist/DeployConsoleParallel-deepin25-x86_64.tar.gz
 ```
+
+Linux 与 macOS 可通过 `DEPLOY_CONSOLE_VENV` 指定构建虚拟环境。Linux 包受构建机的 glibc 和 CPU 架构约束；当前 Ubuntu 24.04 x86_64 包不承诺兼容旧版发行版。Linux 桌面需具备 Qt 所需的系统运行库和中文字体。本次 WSL 构建日志提示 `libxcb-*`、`libxkbcommon-x11` 等未收集，客户桌面需提供这些运行库；离屏启动检查不替代真实 X11/Wayland 和浏览器验收。macOS 的 Intel 与 Apple Silicon 版本分别在对应架构上构建。
 
 macOS 正式分发前应设置 `CODESIGN_IDENTITY` 完成签名，并按组织发布流程执行 Apple 公证。
 
@@ -187,6 +201,7 @@ deployment-tool/
 ├─ DeployConsole.spec      # 唯一 PyInstaller 配置
 ├─ build.bat               # Windows 打包入口
 ├─ build-macos.sh          # macOS .app/.dmg 打包入口
+├─ build-linux.sh          # Linux 原生构建与 tar.gz 打包入口
 ├─ build-deepin.sh         # Deepin Linux 打包入口
 ├─ requirements.txt        # Python 依赖
 ├─ HANDOFF.md              # 开发交接文档
@@ -206,4 +221,4 @@ deployment-tool/
 - PyInstaller 不能跨操作系统生成原生包：Windows EXE、macOS `.app` 和 Linux ELF 必须分别在对应系统构建。
 - 当前已验证 Windows 与 Ubuntu/WSL AMD64 构建；Deepin 包目标为 Deepin 25 AMD64，仍建议在真实 Deepin 25 桌面执行一次浏览器与剪贴板验收。
 - macOS 构建脚本已就绪，但必须在真实 Mac 上生成并验证 `.app/.dmg`；未签名包可能被 Gatekeeper 阻止。
-- macOS 与 Deepin 首次使用时需要重新录入原 Windows 配置中的密码和 Token。
+- macOS 与 Linux 首次使用时需要重新录入原 Windows 配置中的密码和 Token。

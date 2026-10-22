@@ -166,12 +166,11 @@ class JenkinsLoginTests(unittest.TestCase):
                 other.close()
                 other.deleteLater()
 
-    def test_non_windows_login_also_verifies_identity_before_loading(self):
-        self.responses.append((200, {"jobs": [{"name": "service", "_class": "project"}]}))
+    def test_non_windows_cached_login_still_verifies_identity(self):
         with patch("main.sys.platform", "linux"):
             self.tool.login_jenkins()
             self.drain()
-        self.assertEqual(self.urls, ["https://jenkins.example/whoAmI/api/json", "https://jenkins.example/api/json"])
+        self.assertEqual(self.urls, ["https://jenkins.example/whoAmI/api/json"])
         self.assertIn("登录成功", self.tool.path_label.text())
         self.assertEqual(self.tool.job_tree.topLevelItemCount(), 1)
         self.assertEqual(self.tool.loading_count, 0)

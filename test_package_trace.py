@@ -175,6 +175,20 @@ class MemorySource:
 
 
 class TraceSearchTests(unittest.TestCase):
+    def test_retained_package_older_than_first_fifty_builds_is_found(self):
+        package = "etmbackend-5.3.0:5.3.0.1001.10907"
+        source = MemorySource()
+        source.pages = {0: [source.build(number) for number in range(1050, 1000, -1)],
+                        50: [source.build(1000)]}
+        source.logs = {number: "Finished: SUCCESS" for number in range(1000, 1051)}
+        source.logs[1000] = "Successfully tagged registry.example/industry/" + package
+        report = trace_packages(source, [package])
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["unmatched"], [])
+        self.assertEqual([(row["package"], row["number"]) for row in report["matches"]],
+                         [(package, 1000)])
+        self.assertEqual(source.requests, [0, 50])
+
     def test_mobile_build_log_and_template_metadata_return_the_five_fields(self):
         source = MemorySource()
         source.pages = {0: [{**source.build(10), "timestamp": 1785392100620}]}

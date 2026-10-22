@@ -15,10 +15,13 @@ class WorkspaceContextTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = main.QApplication.instance() or main.QApplication([])
+        # Other UI suites defer widget deletion; finish it before repolishing.
+        cls.app.sendPostedEvents(None, main.QEvent.DeferredDelete)
         cls.previous_style = cls.app.styleSheet()
         cls.app.setStyleSheet(main.GLOBAL_QSS)
-        for name in ("msyh.ttc", "msyhbd.ttc", "segoeui.ttf"):
-            main.QFontDatabase.addApplicationFont(str(Path(os.environ["WINDIR"]) / "Fonts" / name))
+        if main.sys.platform == "win32":
+            for name in ("msyh.ttc", "msyhbd.ttc", "segoeui.ttf"):
+                main.QFontDatabase.addApplicationFont(str(Path(os.environ["WINDIR"]) / "Fonts" / name))
 
     @classmethod
     def tearDownClass(cls):

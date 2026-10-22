@@ -573,7 +573,12 @@ class CoreTests(unittest.TestCase):
             "https://dashboard.172.16.2.47.nip.io/#/pod?namespace=etm",
         )
 
-    def test_windows_dashboard_login_opens_pqm_pods(self):
+    def test_dashboard_login_opens_pqm_pods_on_every_platform(self):
+        for platform in ("win32", "linux", "darwin"):
+            with self.subTest(platform=platform):
+                self._assert_dashboard_login_opens_pqm_pods(platform)
+
+    def _assert_dashboard_login_opens_pqm_pods(self, platform):
         state = {"logged_in": False}
         token_input = Mock()
         token_input.is_displayed.return_value = True
@@ -624,7 +629,7 @@ class CoreTests(unittest.TestCase):
         }
 
         with (
-            patch("main.sys.platform", "win32"),
+            patch("main.sys.platform", platform),
             patch("main.create_browser_driver", return_value=driver),
             patch("main.unprotect_secret", return_value="dashboard-token"),
             patch("main.importlib.import_module", side_effect=import_module),

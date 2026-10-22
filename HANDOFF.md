@@ -65,10 +65,10 @@ Jenkins 构建成功
 ### 单窗口任务生命周期
 
 1. `ApplicationWindowManager.create_window()` 为兼容旧调用名而保留，但只创建嵌入式任务，不再创建系统窗口。
-2. `Ctrl+N` 和标题栏“新建任务”入口最终都创建新的 `DeployTool` 工作区；SSH 模式继承当前目标环境。底部任务中心只负责状态展示、任务切换和展开收起。
+2. `Ctrl+N`（macOS 为 `⌘N`）和标题栏“新建任务”入口最终都创建新的 `DeployTool` 工作区；SSH 模式继承当前目标环境。底部任务中心只负责状态展示、任务切换和展开收起。
 3. `DeployTool._begin_tracked_task()` 冻结本次任务标题、包号和目标；构建、SSH 与 Ops 信号持续更新任务中心摘要。
 4. 一个工作区同一时间只允许一个打包或部署操作。并行操作必须新建任务，避免日志、取消事件和状态被覆盖。
-5. 运行中的任务不能移除；主窗口右上角“×”隐藏到 Windows 系统托盘，任务继续在后台运行，单击托盘图标恢复。通过托盘菜单或“配置迁移 → 退出应用”请求真正退出时，仍会拒绝关闭并提示先结束运行中的任务。
+5. 运行中的任务不能移除；主窗口右上角“×”隐藏到系统托盘或 macOS 菜单栏；桌面不支持托盘时最小化，任务继续在后台运行，单击托盘图标恢复。通过托盘菜单或“配置迁移 → 退出应用”请求真正退出时，仍会拒绝关闭并提示先结束运行中的任务。
 6. 任务切换只改变可见工作区，不影响后台 `Worker`、合批等待或远程命令。
 
 发布更新前必须退出应用并核实进程已结束。PyInstaller 在延迟导入时会重新读取 EXE 中的归档；运行期间即使能重命名旧文件，也不能替换原路径，否则旧进程可能报 `Error -3 while decompressing data`。Dashboard 浏览器依赖加载失败由其自身回退提示处理，不改变已完成的部署结果。
@@ -102,6 +102,10 @@ Jenkins 构建成功
 `package_trace.py` 负责第四页“包号溯源”的只读历史检索：默认按包号的产品与服务组合筛选任务，通过 `allBuilds` 分页，匹配日志中的镜像生成或推送证据，再关联同次构建的触发用户和 SCM / checkout 记录。列表、详情和复制仅输出包号、打包人、打包分支、打包时间、代码仓库；仅推送记录的来源字段保持未确认。查询有独立取消事件，使用现有 Worker 生命周期；结果仅保留当前会话，不保存原始日志，不读取构建的完整参数或环境变量。分支无法确认时保留未知状态，不能用当前任务参数代替。回归检查见 `test_package_trace.py`、`test_package_trace_ui.py`。
 
 日志解析兼容 BuildKit `naming to <镜像> 0.0s done` 以及 DockerBuild 的 `--->` 推送输出前缀；必须保留完整包号匹配，不能仅凭 shell 命令或包号回显判定产出。页面自动按包号查询，四个操作按钮靠右，查询范围说明收在状态行提示中。
+
+包号溯源仅使用 Jenkins，左侧为可选任务树，右侧为包号输入及结果，操作按钮在输入框下方靠右。复用 `JenkinsJobBrowser`、任务缓存和筛选方法，溯源选择独立，清空搜索框时立即取消路径及高亮，再次点击已选任务也可取消；不选路径时按包号自动匹配。任务树上方只保留搜索和刷新，筛选后不可见的任务不再限制查询范围。账号或完整包号变化会使异步返回失效。Ops 溯源入口及专用查询代码已移除，因为部署记录不能提供构建来源；云端部署仍使用原有 Ops API。回归检查见 `test_package_trace.py`、`test_package_trace_ui.py`。85 主机汇总日志尚无已验证的读取入口，未接入。
+
+2026-10-22 只读核验：`IappPack/ETM/6-SERVICE-5.3.0` 的 `allBuilds` API 当时只返回 #1014～#1018，对应包号尾号 10921～10925；从索引 5 向后读取为空，配置 `numToKeepStr=5`。另检查云应用 ETM 的废弃 SERVICE、HUAWEI、PDF 及二开 ETM SERVICE，合计 5 个任务、19 次现存构建，未命中 `etmbackend-5.3.0:5.3.0.1001.10907`。不能把已被清理的构建说成可通过分页恢复，也不能把包号尾号当成构建编号。
 
 ### `test_core.py`
 
@@ -175,12 +179,12 @@ Deepin:  ${XDG_CONFIG_HOME:-~/.config}/BuildDeployToolParallel/config.json
 
 ### 登录与任务浏览
 
-`login_jenkins` 创建 `JenkinsClient`，后台通过 `/whoAmI/api/json` 验证非匿名登录身份。Windows 首次登录递归读取完整任务树，已有有效任务树缓存则在身份验证通过后复用；验证和加载全部成功才显示“登录成功”并收起连接栏，失败保持展开并显示具体错误。参数和分支按任务点击读取并缓存，不等待 Ops 目标加载。任务树刷新验证身份后只更新目录，保留已有参数和云端目标缓存，不受搜索过滤限制。macOS 和 Deepin 同样先验证身份，仍按任务树展开按需读取子任务。登录行为回归见 `test_jenkins_login.py`。
+`login_jenkins` 创建 `JenkinsClient`，后台通过 `/whoAmI/api/json` 验证非匿名登录身份。三端首次登录均递归读取完整任务树，已有有效任务树缓存则在身份验证通过后复用；验证和加载全部成功才显示“登录成功”并收起连接栏，失败保持展开并显示具体错误。参数和分支按任务点击读取并缓存，不等待 Ops 目标加载。任务树刷新验证身份后只更新目录，保留已有参数和云端目标缓存，不受搜索过滤限制。三端均在凭据完整时自动登录，并共用完整任务树搜索、刷新、包号溯源任务选择和“打包后部署”开关。登录行为回归见 `test_jenkins_login.py`，跨平台功能与 Linux/macOS 登录失败场景见 `test_cross_platform.py`。
 
 需要保留的行为：
 
 - 使用 Jenkins 返回的真实 Job URL，不要仅依赖显示名称重建 URL。
-- Windows 持久缓存必须校验版本、Jenkins 地址、账号和节点结构；手动刷新成功后才覆盖旧缓存，刷新失败时保留已有缓存。
+- 持久缓存必须校验版本、Jenkins 地址、账号和节点结构；手动刷新成功后才覆盖旧缓存，刷新失败时保留已有缓存。
 - `selection_cache` 保存参数定义及云端界面选项，按平台地址、账号及 Job 或云厂商/专案隔离，跨任务和重启复用；缓存命中直接渲染，不创建 Worker。构建参数及分支仅在点击未缓存任务时读取，启动和任务树刷新均不遍历预加载；旧版本完整或部分缓存直接兼容，失败任务再次点击可重试。参数缓存不保存密码参数默认值，配置导出不携带此缓存。异步结果必须校验连接身份和当前请求，旧连接结果不得覆盖新连接。分支刷新只更新对应参数，云端选项加载和刷新仍遍历全部专案，真实部署仍由 API 校验。
 - Git 参数通过 Git Parameter 插件接口读取候选值。
 - `GIT_BRANCH`/`GIT_BRANCH2` 参数旁提供“刷新分支”按钮，通过 Jenkins Git Parameter 接口异步更新当前列表；刷新失败保留原列表，且不重置同一任务的其他参数。
@@ -232,8 +236,7 @@ Jenkins 构建完成后必须满足：
 
 - 更新远程文件前，在同目录创建 `.bak.YYYYMMDDHHMMSS` 备份。
 - 上传或校验失败时尝试恢复备份。
-- Windows SSH 部署调用 `core.update_image_list(..., clear_existing=True)`，备份后清空镜像清单并仅写入本次包号，避免拉取脚本重复处理历史镜像。
-- macOS 和 Deepin 暂时仍使用 `core.update_image_list` 的默认行为，只按镜像名称替换目标行，不得误改其他镜像。
+- 三端 SSH 镜像搬运均使用 `_create_isolated_image_workspace` 创建本次任务或合批的独立清单，只包含本次包号；共享镜像清单保持不变，临时工作区在收尾时清理。
 - `core.update_yaml_image` 只修改匹配镜像的 `image:` 行。
 - 命令非零退出必须停止后续步骤。
 - 部署阶段取消只能在当前远程步骤结束后阻止后续步骤；不要在线程中强杀 SSH 命令而留下未知状态。
@@ -268,7 +271,7 @@ TAB3 通过 IAM/BFF API 加载目标并部署；显式点击“登录并加载�
 环境页面与 Dashboard 使用不同的打开策略：
 
 - 双击环境名称列，使用系统默认浏览器打开环境 URL，并将已保存的环境密码复制到剪贴板、显示账号；默认浏览器不执行自动填充。
-- 双击 Dashboard 地址列，自动查找 Token 输入框、填写 Token 并登录；Windows 登录成功后将当前 Dashboard 域名导航到 `/#/pod?namespace=etm`，直接显示 ETM Pods。
+- 双击 Dashboard 地址列，自动查找 Token 输入框、填写 Token 并登录；三端登录成功后均将当前 Dashboard 域名导航到 `/#/pod?namespace=etm`，直接显示 ETM Pods。
 - 成功后保留浏览器供用户使用。
 - Dashboard 页面结构不兼容时，回退为复制 Token 并使用系统默认浏览器打开 Dashboard。
 - 不要移除回退路径；自动化失败不能阻止用户手工登录。
@@ -277,7 +280,7 @@ TAB3 通过 IAM/BFF API 加载目标并部署；显式点击“登录并加载�
 
 所有网络、SSH、Selenium 和长时间操作必须通过 `Worker(QThread)` 执行。后台线程不能直接修改 Qt 控件，应通过 `DeployTool.emit` 映射到信号，再由主线程槽函数更新 UI。
 
-任务中心折叠高度固定为 46px，展开后由底部 `QDockWidget` 占用约 270px。任务失败时自动展开；任务行点击切换 `QStackedWidget` 当前页。点击包号列或选中任务后按 Ctrl+C 可复制完整包号，无包号时不修改剪贴板。环境部署左栏使用滚动容器，避免展开任务中心时压缩表单行。不要把完整任务表单复制进底栏，也不要为任务恢复默认新窗口行为。
+任务中心折叠高度固定为 46px，展开后由底部 `QDockWidget` 占用约 270px。任务失败时自动展开；任务行点击切换 `QStackedWidget` 当前页。点击包号列或选中任务后按 Ctrl+C（macOS 为 ⌘C）可复制完整包号，无包号时不修改剪贴板。环境部署左栏使用滚动容器，避免展开任务中心时压缩表单行。不要把完整任务表单复制进底栏，也不要为任务恢复默认新窗口行为。
 
 状态规则：
 
@@ -326,6 +329,7 @@ python -m unittest test_core.py test_package_inference.py test_parallel_windows.
 ```text
 Windows: build.bat
 macOS:   build-macos.sh
+Linux:   build-linux.sh
 Deepin:  build-deepin.sh
 ```
 
@@ -334,6 +338,7 @@ Deepin:  build-deepin.sh
 ```text
 Windows: release/DeployConsoleBatchSafe.exe
 macOS:   dist/DeployConsoleParallel.app、dist/DeployConsoleParallel-macos.dmg
+Linux:   dist/DeployConsoleParallel、dist/DeployConsoleParallel-linux-<架构>.tar.gz
 Deepin:  dist/DeployConsoleParallel、dist/DeployConsoleParallel-deepin25-x86_64.tar.gz
 ```
 

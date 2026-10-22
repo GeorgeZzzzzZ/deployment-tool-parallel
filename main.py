@@ -70,7 +70,9 @@ from core import (
 from ops_api import (
     OpsApiClient, OpsApiError, OpsSubmissionUnknown, service_type_id, service_type_label,
 )
-from package_trace import JenkinsHistorySource, format_trace_match, parse_packages, trace_packages, trace_result_fields
+from package_trace import (
+    JenkinsHistorySource, format_trace_match, parse_packages, trace_packages, trace_result_fields,
+)
 
 # ── Color Palette (Glassmorphism / Frosted Glass / Modern SaaS) ─────
 COLORS = {
@@ -2497,6 +2499,69 @@ class ClickExpandTreeWidget(QTreeWidget):
         super().keyPressEvent(event)
 
 
+class JenkinsJobBrowser(QWidget):
+    """Shared task picker with independent selection and a shared cache supplied by its owner."""
+
+    def __init__(self, parent=None, *, searchable=True):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.tree = ClickExpandTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setAnimated(True)
+        self.tree.setIndentation(26)
+        self.branch_style = ClearTreeBranchStyle()
+        self.tree.setStyle(self.branch_style)
+
+        if searchable:
+            search_row = QHBoxLayout()
+            search_row.setSpacing(6)
+            self.search = QLineEdit()
+            self.search.setPlaceholderText("搜索二级模块...")
+            self.search.setClearButtonEnabled(False)
+            self.search.setFixedHeight(34)
+            self.search.setAccessibleName("任务模糊查询")
+            self.search.setEnabled(False)
+            search_row.addWidget(self.search, 1)
+            self.refresh = QToolButton()
+            self.refresh.setIcon(
+                ui_icon("refresh-cw")
+            )
+            self.refresh.setIconSize(QSize(18, 18))
+            self.refresh.setFixedSize(34, 34)
+            self.refresh.setAccessibleName("重置 Jenkins 任务缓存")
+            self.refresh.setToolTip(
+                "刷新任务树；构建参数和分支在点击任务时读取并缓存"
+            )
+            self.refresh.setStyleSheet(f"""
+                QToolButton {{
+                    background: {COLORS['input_bg']};
+                    border: 1px solid {COLORS['input_border']};
+                    border-radius: 6px;
+                }}
+                QToolButton:hover {{
+                    background: {COLORS['accent_light']};
+                    border-color: {COLORS['border_focus']};
+                }}
+                QToolButton:pressed {{
+                    background: {COLORS['card_hover']};
+                }}
+                QToolButton:focus {{
+                    border: 2px solid {COLORS['border_focus']};
+                }}
+                QToolButton:disabled {{
+                    background: {COLORS['sidebar_bg']};
+                    border-color: {COLORS['border']};
+                }}
+            """)
+            self.refresh.setEnabled(False)
+            search_row.addWidget(self.refresh)
+            layout.addLayout(search_row)
+        layout.addWidget(self.tree)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Environment Dialog (PySide6)
 # ══════════════════════════════════════════════════════════════════════
@@ -2812,7 +2877,7 @@ class TitleBar(QWidget):
         self.new_task_button.setFixedSize(104, 34)
         self.new_task_button.setStyleSheet(header_button_style)
         self.new_task_button.setToolTip(
-            "在当前软件中新增任务；SSH 模式自动继承当前目标环境（Ctrl+N）"
+            f"在当前软件中新增任务；SSH 模式自动继承当前目标环境（{QKeySequence(QKeySequence.New).toString(QKeySequence.NativeText)}）"
         )
         self.new_task_button.setAccessibleName("在任务中心新建部署任务")
         self.new_task_button.clicked.connect(
@@ -2996,6 +3061,8 @@ class DeployTool(QMainWindow):
         self._running_summary_build_url = ""
         self._trace_request = None
         self._trace_report = None
+        self._trace_job_path = []
+        self._trace_job_client = None
         self.dashboard_drivers = []
         self.cloud_driver = None
         self.ops_api = None
@@ -3423,8 +3490,7 @@ class DeployTool(QMainWindow):
     def _on_dashboard_fallback(self, item, reason):
         self._copy_dashboard_token(item)
         url = item.get("url", "").strip()
-        if sys.platform == "win32":
-            url = dashboard_pods_url(url, item.get("namespace"))
+        url = dashboard_pods_url(url, item.get("namespace"))
         if url:
             webbrowser.open(url)
         QMessageBox.warning(
@@ -3435,11 +3501,7 @@ class DeployTool(QMainWindow):
 
     @Slot(str, str)
     def _on_dashboard_login_ok(self, name, namespace):
-        message = (
-            f"已自动登录并打开 {namespace} Pods：{name}"
-            if sys.platform == "win32"
-            else f"已自动登录：{name}"
-        )
+        message = f"已自动登录并打开 {namespace} Pods：{name}"
         self.deploy_log.appendPlainText(message)
 
     @Slot(str)
@@ -3459,6 +3521,8 @@ class DeployTool(QMainWindow):
     @Slot(bool, str)
     def _on_jenkins_login_finished(self, success, message):
         self._job_cache_loading = False
+        self._sync_trace_job_browser()
+        self.trace_job_browser.setEnabled(success)
         self.job_tree.setEnabled(success)
         self.login_button.setEnabled(True)
         self.login_button.setText("登录并加载")
@@ -3768,6 +3832,7 @@ class DeployTool(QMainWindow):
         self.job_tree_cache = []
         self.job_tree.clear()
         self.path_label.setText("  配置已导入，请重新登录 Jenkins")
+        self._sync_trace_job_browser()
         if hasattr(self, "job_filter_input"):
             self.job_filter_input.clear()
             self.job_filter_input.setEnabled(False)
@@ -3927,8 +3992,7 @@ class DeployTool(QMainWindow):
                 self.build_deploy_mode.currentText(), prompt_for_account=False
             )
         )
-        if sys.platform == "win32":
-            QTimer.singleShot(0, self._auto_login_jenkins)
+        QTimer.singleShot(0, self._auto_login_jenkins)
 
     def _select_page(self, name):
         for index in range(self.tab_widget.count()):
@@ -3976,12 +4040,7 @@ class DeployTool(QMainWindow):
         layout.setSpacing(10)
 
         # ── Connection Card ────────────────────────────────────────
-        if sys.platform == "win32":
-            conn_card = CollapsibleCardWidget(
-                "Jenkins 连接", expanded=True
-            )
-        else:
-            conn_card = CardWidget("Jenkins 连接")
+        conn_card = CollapsibleCardWidget("Jenkins 连接", expanded=True)
         self.jenkins_connection_card = conn_card
         layout.addWidget(conn_card)
 
@@ -4032,71 +4091,20 @@ class DeployTool(QMainWindow):
         sidebar_card.setFixedWidth(280)
         work_splitter.addWidget(sidebar_card)
 
-        self.job_tree = ClickExpandTreeWidget()
-        self.job_tree.setHeaderHidden(True)
-        self.job_tree.setRootIsDecorated(True)
-        self.job_tree.setAnimated(True)
-        self.job_tree.setIndentation(26)
-        self.job_tree_branch_style = ClearTreeBranchStyle()
-        self.job_tree.setStyle(self.job_tree_branch_style)
+        self.job_browser = JenkinsJobBrowser()
+        self.job_tree = self.job_browser.tree
+        self.job_tree_branch_style = self.job_browser.branch_style
         self.job_tree.itemExpanded.connect(self._tree_open)
         self.job_tree.itemClicked.connect(self._tree_select)
-
-        # Windows 登录时缓存完整任务树，查询只匹配根任务下的二级模块，
-        # 并保留命中模块的全部子任务供继续选择。
-        if sys.platform == "win32":
-            search_row = QHBoxLayout()
-            search_row.setSpacing(6)
-            self.job_filter_input = QLineEdit()
-            self.job_filter_input.setPlaceholderText("搜索二级模块...")
-            self.job_filter_input.setClearButtonEnabled(True)
-            self.job_filter_input.setFixedHeight(34)
-            self.job_filter_input.setAccessibleName("任务模糊查询")
-            self.job_filter_input.setEnabled(False)
-            self.job_search_timer = QTimer(self)
-            self.job_search_timer.setSingleShot(True)
-            self.job_search_timer.setInterval(250)
-            self.job_search_timer.timeout.connect(self._start_job_search)
-            self.job_filter_input.textChanged.connect(
-                self._on_job_filter_changed
-            )
-            search_row.addWidget(self.job_filter_input, 1)
-            self.job_cache_refresh_button = QToolButton()
-            self.job_cache_refresh_button.setIcon(
-                ui_icon("refresh-cw")
-            )
-            self.job_cache_refresh_button.setIconSize(QSize(18, 18))
-            self.job_cache_refresh_button.setFixedSize(34, 34)
-            self.job_cache_refresh_button.setAccessibleName("重置 Jenkins 任务缓存")
-            self.job_cache_refresh_button.setToolTip(
-                "刷新任务树；构建参数和分支在点击任务时读取并缓存"
-            )
-            self.job_cache_refresh_button.setStyleSheet(f"""
-                QToolButton {{
-                    background: {COLORS['input_bg']};
-                    border: 1px solid {COLORS['input_border']};
-                    border-radius: 6px;
-                }}
-                QToolButton:hover {{
-                    background: {COLORS['accent_light']};
-                    border-color: {COLORS['border_focus']};
-                }}
-                QToolButton:pressed {{
-                    background: {COLORS['card_hover']};
-                }}
-                QToolButton:focus {{
-                    border: 2px solid {COLORS['border_focus']};
-                }}
-                QToolButton:disabled {{
-                    background: {COLORS['sidebar_bg']};
-                    border-color: {COLORS['border']};
-                }}
-            """)
-            self.job_cache_refresh_button.clicked.connect(self.refresh_job_cache)
-            self.job_cache_refresh_button.setEnabled(False)
-            search_row.addWidget(self.job_cache_refresh_button)
-            sidebar_card.content_layout().addLayout(search_row)
-        sidebar_card.content_layout().addWidget(self.job_tree)
+        self.job_filter_input = self.job_browser.search
+        self.job_cache_refresh_button = self.job_browser.refresh
+        self.job_search_timer = QTimer(self)
+        self.job_search_timer.setSingleShot(True)
+        self.job_search_timer.setInterval(250)
+        self.job_search_timer.timeout.connect(self._start_job_search)
+        self.job_filter_input.textChanged.connect(self._on_job_filter_changed)
+        self.job_cache_refresh_button.clicked.connect(self.refresh_job_cache)
+        sidebar_card.content_layout().addWidget(self.job_browser)
 
         # Keep the selected job and build controls visible above the scroll area.
         right_column = QWidget()
@@ -4151,16 +4159,15 @@ class DeployTool(QMainWindow):
         environment_row.setSpacing(8)
         toolbar.addLayout(environment_row)
 
-        # Windows 版支持关闭后续部署。默认开启，保持升级前的一键流程行为。
-        if sys.platform == "win32":
-            self.deploy_after_build_checkbox = ToggleSwitch("打包后部署")
-            self.deploy_after_build_checkbox.setChecked(
-                bool(saved.get("deploy_after_build", True))
-            )
-            self.deploy_after_build_checkbox.setToolTip(
-                "开启：打包后继续部署并查看状态；关闭：仅执行 Jenkins 打包"
-            )
-            action_row.addWidget(self.deploy_after_build_checkbox)
+        # 默认开启，保持升级前的一键流程行为。
+        self.deploy_after_build_checkbox = ToggleSwitch("打包后部署")
+        self.deploy_after_build_checkbox.setChecked(
+            bool(saved.get("deploy_after_build", True))
+        )
+        self.deploy_after_build_checkbox.setToolTip(
+            "开启：打包后继续部署并查看状态；关闭：仅执行 Jenkins 打包"
+        )
+        action_row.addWidget(self.deploy_after_build_checkbox)
 
         self.build_button = QPushButton("开始一键流程")
         self.build_button.setObjectName("SuccessBtn")
@@ -4442,9 +4449,18 @@ class DeployTool(QMainWindow):
         log_card.content_layout().addWidget(self.build_log)
 
     def _build_package_trace_tab(self, page):
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer = QHBoxLayout(page)
+        outer.setContentsMargins(20, 16, 20, 16)
+        work_splitter = QSplitter(Qt.Horizontal)
+        work_splitter.setChildrenCollapsible(False)
+        work_splitter.setHandleWidth(8)
+        outer.addWidget(work_splitter)
+        self.trace_job_panel = CardWidget("Jenkins 任务路径（可选）")
+        self.trace_job_panel.setAccessibleName("Jenkins 溯源任务路径")
+        self.trace_job_panel.setMinimumWidth(260)
+        work_splitter.addWidget(self.trace_job_panel)
         scroll = QScrollArea()
+        scroll.setMinimumWidth(600)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
@@ -4452,9 +4468,12 @@ class DeployTool(QMainWindow):
         content_widget.setObjectName("PackageTraceScrollContent")
         content_widget.setMinimumHeight(620)
         scroll.setWidget(content_widget)
-        outer.addWidget(scroll)
+        work_splitter.addWidget(scroll)
+        work_splitter.setStretchFactor(0, 0)
+        work_splitter.setStretchFactor(1, 1)
+        work_splitter.setSizes([300, 1000])
         layout = QVBoxLayout(content_widget)
-        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         card = CardWidget("包号溯源")
         layout.addWidget(card)
@@ -4462,6 +4481,22 @@ class DeployTool(QMainWindow):
         hint = QLabel("每行一个包号，按产品和服务筛选任务，支持后端、前端和 APP 包。")
         hint.setWordWrap(True)
         content.addWidget(hint)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        self.trace_open_button = QPushButton("查看构建")
+        self.trace_open_button.clicked.connect(self._open_package_trace)
+        self.trace_cancel_button = QPushButton("取消查询")
+        self.trace_cancel_button.setObjectName("DangerBtn")
+        self.trace_cancel_button.setEnabled(False)
+        self.trace_cancel_button.clicked.connect(self._cancel_package_trace)
+        self.trace_copy_button = QPushButton("复制结果")
+        self.trace_copy_button.clicked.connect(self._copy_package_trace)
+        self.trace_search_button = QPushButton("查询来源")
+        self.trace_search_button.setObjectName("PrimaryBtn")
+        self.trace_search_button.clicked.connect(self._start_package_trace)
+        for widget in (self.trace_open_button, self.trace_cancel_button,
+                       self.trace_copy_button, self.trace_search_button):
+            controls.addWidget(widget)
         self.trace_input = QPlainTextEdit()
         self.trace_input.setAccessibleName("待溯源包号")
         self.trace_input.setPlaceholderText(
@@ -4470,23 +4505,21 @@ class DeployTool(QMainWindow):
         )
         self.trace_input.setFixedHeight(74)
         content.addWidget(self.trace_input)
-        controls = QHBoxLayout()
-        controls.addStretch()
-        self.trace_search_button = QPushButton("查询来源")
-        self.trace_search_button.setObjectName("PrimaryBtn")
-        self.trace_search_button.clicked.connect(self._start_package_trace)
-        self.trace_cancel_button = QPushButton("取消查询")
-        self.trace_cancel_button.setObjectName("DangerBtn")
-        self.trace_cancel_button.setEnabled(False)
-        self.trace_cancel_button.clicked.connect(self._cancel_package_trace)
-        self.trace_copy_button = QPushButton("复制结果")
-        self.trace_copy_button.clicked.connect(self._copy_package_trace)
-        self.trace_open_button = QPushButton("查看构建")
-        self.trace_open_button.clicked.connect(self._open_package_trace)
-        for widget in (self.trace_open_button, self.trace_cancel_button,
-                       self.trace_copy_button, self.trace_search_button):
-            controls.addWidget(widget)
         content.addLayout(controls)
+        jenkins_layout = self.trace_job_panel.content_layout()
+        self.trace_job_browser = JenkinsJobBrowser()
+        self.trace_job_browser.setMinimumHeight(175)
+        self.trace_job_browser.search.setAccessibleName("溯源任务模糊查询")
+        self.trace_job_browser.tree.setToolTip("选择具体任务后只查该路径；清空搜索框或再次点击已选任务可取消选择。")
+        self.trace_job_browser.tree.itemClicked.connect(self._select_trace_job)
+        self.trace_job_browser.tree.itemExpanded.connect(self._tree_open)
+        self.trace_job_search_timer = QTimer(self)
+        self.trace_job_search_timer.setSingleShot(True)
+        self.trace_job_search_timer.setInterval(250)
+        self.trace_job_search_timer.timeout.connect(self._sync_trace_job_browser)
+        self.trace_job_browser.search.textChanged.connect(self._on_trace_job_filter_changed)
+        self.trace_job_browser.refresh.clicked.connect(self.refresh_job_cache)
+        jenkins_layout.addWidget(self.trace_job_browser, 1)
         self.trace_status = QLabel("等待查询。")
         self.trace_status.setToolTip("打包时间使用 Jenkins 构建记录时间（UTC+8）。")
         self.trace_status.setTextFormat(Qt.PlainText)
@@ -4510,29 +4543,102 @@ class DeployTool(QMainWindow):
         self.trace_details.setPlaceholderText("包号：\n打包人：\n打包分支：\n打包时间：\n代码仓库：")
         splitter.addWidget(self.trace_details)
         splitter.setSizes([260, 170])
+        self.trace_input.textChanged.connect(self._invalidate_package_trace_input)
+        self._sync_trace_job_browser()
+
+    def _on_trace_job_filter_changed(self, text):
+        if not text.strip():
+            self._clear_trace_job()
+        self.trace_job_search_timer.start()
+
+    def _clear_trace_job(self):
+        self._trace_job_path = []
+        self.trace_job_browser.tree.clearSelection()
+        self.trace_job_browser.tree.setCurrentItem(None)
+
+    def _select_trace_job(self, item, _column):
+        if not self.jenkins or self._job_cache_loading or self._trace_request:
+            return
+        data = item.data(0, Qt.UserRole)
+        if not data or data.get("is_folder") or list(data["path"]) == self._trace_job_path:
+            self._clear_trace_job()
+            return
+        self._trace_job_client = self.jenkins
+        self._trace_job_path = list(data["path"])
+        self.trace_job_browser.tree.setCurrentItem(item)
+
+    def _sync_trace_job_browser(self):
+        if not hasattr(self, "trace_job_browser"):
+            return
+        browser = self.trace_job_browser
+        if self._trace_job_client is not self.jenkins:
+            self._trace_job_client = self.jenkins
+            self._clear_trace_job()
+        enabled = self.jenkins is not None and not self._job_cache_loading
+        browser.setEnabled(enabled)
+        browser.search.setEnabled(enabled)
+        browser.refresh.setEnabled(enabled)
+        query = browser.search.text().strip()
+        filtered, _count = self._filter_job_cache(self.job_tree_cache, query)
+        self._render_job_cache(filtered, expand_depth=1 if query else 0, tree=browser.tree)
+        if self._trace_job_path and not self._job_cache_loading:
+            pending = [browser.tree.topLevelItem(index)
+                       for index in range(browser.tree.topLevelItemCount())]
+            while pending:
+                item = pending.pop()
+                if item.isHidden():
+                    continue
+                data = item.data(0, Qt.UserRole) or {}
+                if data.get("path") == self._trace_job_path:
+                    browser.tree.setCurrentItem(item)
+                    parent = item.parent()
+                    while parent is not None:
+                        parent.setExpanded(True)
+                        parent = parent.parent()
+                    break
+                pending.extend(item.child(index) for index in range(item.childCount()))
+            else:
+                # The tree is the only scope indicator; do not keep a hidden selection.
+                self._clear_trace_job()
+
+    def _invalidate_package_trace_input(self, *_args):
+        request = self._trace_request
+        if request and request["input"] != self.trace_input.toPlainText().strip():
+            request["cancel"].set()
+        if not request:
+            self._trace_report = None
+            self.trace_results.clear()
+            self.trace_details.clear()
+            self.trace_status.setText("等待查询。")
+            self.trace_status.setToolTip("")
 
     def _set_package_trace_busy(self, busy):
-        for widget in (self.trace_input, self.trace_search_button):
+        for widget in (self.trace_input, self.trace_search_button, self.trace_job_panel):
             widget.setEnabled(not busy)
         self.trace_cancel_button.setEnabled(busy)
 
     def _start_package_trace(self):
         if self._trace_request is not None:
             return
-        if self.jenkins is None or self._job_cache_loading:
-            self.trace_status.setText("请先在 Jenkins 页完成登录并加载任务，再查询包号。")
-            return
         try:
             packages = parse_packages(self.trace_input.toPlainText())
+            if self.jenkins is None or self._job_cache_loading:
+                self.trace_status.setText("请先在 Jenkins 页完成登录并加载任务，再查询包号。")
+                return
+            if self._trace_job_client is not self.jenkins:
+                self._sync_trace_job_browser()
+            selected = list(self._trace_job_path) or None
+            request = {"client": self.jenkins}
         except ValueError as exc:
             self.trace_status.setText(str(exc))
             return
-        request = {"client": self.jenkins, "cancel": threading.Event()}
+        request["cancel"] = threading.Event()
+        request["input"] = self.trace_input.toPlainText().strip()
         self._trace_request = request
         self._trace_report = None
         self.trace_results.clear()
         self.trace_details.clear()
-        self.trace_status.setToolTip("打包时间使用 Jenkins 构建记录时间（UTC+8）。")
+        self.trace_status.setToolTip("")
         self._set_package_trace_busy(True)
         self.trace_status.setText("正在读取历史构建，旧包查询可能需要较长时间；可以随时取消。")
 
@@ -4541,10 +4647,11 @@ class DeployTool(QMainWindow):
 
         def query():
             try:
+                callbacks = {"progress": lambda value: send("progress", value),
+                             "on_match": lambda value: send("match", value)}
                 source = JenkinsHistorySource(request["client"], request["cancel"])
-                report = trace_packages(source, packages,
-                                        progress=lambda value: send("progress", value),
-                                        on_match=lambda value: send("match", value))
+                report = trace_packages(source, packages, scope="selected" if selected else "auto",
+                                        selected=selected, **callbacks)
             except (RuntimeError, ValueError) as exc:
                 report = {"error": str(exc)}
             except Exception:
@@ -4566,14 +4673,17 @@ class DeployTool(QMainWindow):
         if request is not self._trace_request:
             return
         kind, data = event["kind"], event["data"]
-        if request["client"] is not self.jenkins:
+        stale = (request["input"] != self.trace_input.toPlainText().strip() or
+                 request["client"] is not self.jenkins)
+        if stale:
             request["cancel"].set()
             if kind == "finished":
                 self._trace_request = None
+                self._trace_report = None
                 self._set_package_trace_busy(False)
                 self.trace_results.clear()
                 self.trace_details.clear()
-                self.trace_status.setText("Jenkins 连接已切换，请重新查询。")
+                self.trace_status.setText("查询账号或包号已切换，请重新查询。")
             return
         if kind == "progress":
             if not request["cancel"].is_set():
@@ -4616,7 +4726,7 @@ class DeployTool(QMainWindow):
 
     def _open_package_trace(self, *_args):
         item = self.trace_results.currentItem()
-        if item:
+        if item and item.data(0, Qt.UserRole).get("url"):
             webbrowser.open(item.data(0, Qt.UserRole)["url"])
 
     # ── Deploy Tab ─────────────────────────────────────────────────
@@ -5176,14 +5286,7 @@ class DeployTool(QMainWindow):
         self.path_label.setToolTip("")
         if isinstance(self.jenkins_connection_card, CollapsibleCardWidget):
             self.jenkins_connection_card._toggle.setText("Jenkins 连接 · 正在验证")
-        if sys.platform == "win32":
-            self._start_job_cache_load(cached_jobs=self._load_saved_job_cache())
-        else:
-            self._job_cache_loading = True
-            self.job_tree.setEnabled(False)
-            self.build_button.setEnabled(False)
-            self.emit("loading_start", "正在验证 Jenkins 登录身份...")
-            self.run_thread(self._load_root_jobs)
+        self._start_job_cache_load(cached_jobs=self._load_saved_job_cache())
 
     def _load_root_jobs(self):
         try:
@@ -5259,7 +5362,7 @@ class DeployTool(QMainWindow):
         return jobs
 
     def _save_job_cache(self, cache):
-        """Persist a freshly fetched Windows task tree for later launches."""
+        """Persist a freshly fetched task tree for later launches."""
         url, username = DeployTool._job_cache_identity(self.jenkins)
         self.store.data.setdefault("jenkins", {})["job_cache"] = {
             "version": JENKINS_JOB_CACHE_VERSION,
@@ -5280,6 +5383,7 @@ class DeployTool(QMainWindow):
         generation = self._job_cache_generation
         client = self.jenkins
         self._job_cache_loading = True
+        self._sync_trace_job_browser()
         self.job_tree.setEnabled(False)
         self.job_cache_refresh_button.setEnabled(False)
         self.job_filter_input.setEnabled(False)
@@ -5334,15 +5438,15 @@ class DeployTool(QMainWindow):
             for node in nodes
         )
 
-    def _render_job_cache(self, cache, expand_depth=0):
+    def _render_job_cache(self, cache, expand_depth=0, *, tree=None):
         """Render cached jobs and expand only nodes above ``expand_depth``."""
-        self.job_tree.clear()
+        destination = tree if tree is not None else self.job_tree
+        destination.clear()
 
         def add_nodes(parent_item, path, nodes, depth):
             for node in nodes:
-                item = self._create_job_tree_item(
-                    parent_item, path, node, add_placeholder=False
-                )
+                options = {"tree": destination} if tree is not None else {}
+                item = self._create_job_tree_item(parent_item, path, node, add_placeholder=False, **options)
                 children = node.get("children", [])
                 add_nodes(item, path + [node["name"]], children, depth + 1)
                 item.setExpanded(depth < expand_depth and bool(children))
@@ -5350,7 +5454,7 @@ class DeployTool(QMainWindow):
         add_nodes(None, [], cache, 0)
 
     def refresh_job_cache(self):
-        if sys.platform != "win32" or not self.jenkins:
+        if not self.jenkins:
             return
         if self.loading_count:
             return
@@ -5376,6 +5480,7 @@ class DeployTool(QMainWindow):
         self._show_parameters([], [])
         self.build_button.setEnabled(False)
         self.job_tree_cache = cache
+        self._sync_trace_job_browser()
         try:
             if not result.get("cached"):
                 self._save_job_cache(cache)
@@ -5411,6 +5516,7 @@ class DeployTool(QMainWindow):
         if generation != self._job_cache_generation:
             return
         self._job_cache_loading = False
+        self._sync_trace_job_browser()
         self.job_tree.setEnabled(True)
         self._update_build_cloud_ready()
         self.job_filter_input.setEnabled(bool(self.job_tree_cache))
@@ -5445,7 +5551,7 @@ class DeployTool(QMainWindow):
         if hasattr(self, "job_filter_input") and self.job_filter_input.text().strip():
             self._apply_job_filter(self.job_filter_input.text())
 
-    def _create_job_tree_item(self, parent_item, path, job, add_placeholder=True):
+    def _create_job_tree_item(self, parent_item, path, job, add_placeholder=True, *, tree=None):
         item_path = path + [job["name"]]
         display_name = job.get("displayName") or job["name"]
         item = QTreeWidgetItem()
@@ -5461,7 +5567,7 @@ class DeployTool(QMainWindow):
         if parent_item is not None:
             parent_item.addChild(item)
         else:
-            self.job_tree.addTopLevelItem(item)
+            (tree if tree is not None else self.job_tree).addTopLevelItem(item)
 
         if add_placeholder and "folder" in job.get("_class", "").lower():
             placeholder = QTreeWidgetItem()
@@ -6631,7 +6737,7 @@ class DeployTool(QMainWindow):
         if getattr(self, "_task_runtime_active", False):
             self.message_overlay.show_message(
                 "当前任务正在运行",
-                "请等待当前操作结束，或点击标题栏“新建任务”并行执行（Ctrl+N）。",
+                f"请等待当前操作结束，或点击标题栏“新建任务”并行执行（{QKeySequence(QKeySequence.New).toString(QKeySequence.NativeText)}）。",
             )
             return
         if self.build_running:
@@ -7346,7 +7452,7 @@ class DeployTool(QMainWindow):
         if getattr(self, "_task_runtime_active", False):
             self.message_overlay.show_message(
                 "当前任务正在运行",
-                "请等待当前操作结束，或点击标题栏“新建任务”并行执行（Ctrl+N）。",
+                f"请等待当前操作结束，或点击标题栏“新建任务”并行执行（{QKeySequence(QKeySequence.New).toString(QKeySequence.NativeText)}）。",
             )
             return
         try:
@@ -8433,7 +8539,7 @@ class DeployTool(QMainWindow):
         if getattr(self, "_task_runtime_active", False):
             self.message_overlay.show_message(
                 "当前任务正在运行",
-                "请等待当前操作结束，或点击标题栏“新建任务”并行执行（Ctrl+N）。",
+                f"请等待当前操作结束，或点击标题栏“新建任务”并行执行（{QKeySequence(QKeySequence.New).toString(QKeySequence.NativeText)}）。",
             )
             return
         if self.cloud_options_loading:
@@ -9223,9 +9329,7 @@ class DeployTool(QMainWindow):
             tree_item.setText(0, item.get("name", ""))
             tree_item.setText(1, item.get("url", ""))
             tree_item.setToolTip(0, "双击用系统默认浏览器打开环境页面并复制密码")
-            dashboard_tip = "双击自动填写 Dashboard Token 并登录"
-            if sys.platform == "win32":
-                dashboard_tip += "，随后打开 etm Pods"
+            dashboard_tip = "双击自动填写 Dashboard Token 并登录，随后打开 etm Pods"
             tree_item.setToolTip(1, dashboard_tip)
             tree_item.setData(0, Qt.UserRole, index)
             self.dashboard_tree.addTopLevelItem(tree_item)
@@ -9338,8 +9442,7 @@ class DeployTool(QMainWindow):
         if not url:
             QMessageBox.warning(self, "Dashboard 地址为空", "当前 Dashboard 未配置地址")
             return
-        if sys.platform == "win32":
-            url = dashboard_pods_url(url, item.get("namespace"))
+        url = dashboard_pods_url(url, item.get("namespace"))
         webbrowser.open(url)
 
     def _open_dashboard_item(self, item):
@@ -9423,13 +9526,12 @@ class DeployTool(QMainWindow):
 
             wait.until(click_login_button)
             wait.until(lambda browser: not find_token_input(browser))
-            if sys.platform == "win32":
-                pods_url = dashboard_pods_url(url, namespace)
-                driver.get(pods_url)
-                wait.until(
-                    lambda browser: urlsplit(browser.current_url or "").fragment
-                    == urlsplit(pods_url).fragment
-                )
+            pods_url = dashboard_pods_url(url, namespace)
+            driver.get(pods_url)
+            wait.until(
+                lambda browser: urlsplit(browser.current_url or "").fragment
+                == urlsplit(pods_url).fragment
+            )
             self.dashboard_drivers.append(driver)
             self.emit("dashboard_login_ok", (item["name"], namespace))
         except Exception as exc:
@@ -9661,7 +9763,7 @@ class TaskCenterPanel(GlassBackground):
         item.setText(1, descriptor)
         item.setData(1, Qt.UserRole, summary["package"])
         item.setToolTip(
-            1, f"{descriptor}\n点击复制包号，或选中任务后按 Ctrl+C"
+            1, f"{descriptor}\n点击复制包号，或选中任务后按 {QKeySequence(QKeySequence.Copy).toString(QKeySequence.NativeText)}"
             if summary["package"] else descriptor
         )
         item.setText(2, summary["target"] or "-")
