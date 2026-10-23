@@ -191,6 +191,32 @@ def infer_package_target(package):
     )
 
 
+def parse_deployment_packages(text):
+    """Validate the full batch before allowing any deployment side effect."""
+    packages = []
+    applications = {}
+    for line_number, line in enumerate(str(text or "").splitlines(), 1):
+        package = line.strip().strip("[]")
+        if not package:
+            continue
+        try:
+            target = infer_package_target(package)
+        except ValueError as exc:
+            raise ValueError(f"第 {line_number} 行：{exc}") from exc
+        marker = "mobilefrontend" if target["service_type"] == "mobile" else target["service_type"]
+        application = target["product"] + marker
+        if application in applications:
+            raise ValueError(
+                f"应用 {application} 重复（第 {applications[application]}、{line_number} 行）；"
+                "同一应用只能部署一个包，客户名和版本号不同也不能重复。"
+            )
+        applications[application] = line_number
+        packages.append(package)
+    if not packages:
+        raise ValueError("请至少输入一个包号，每行一个")
+    return packages
+
+
 def infer_ssh_deployment_config(package):
     """Infer the SSH YAML target from a deployment image package number."""
     target = infer_package_target(package)

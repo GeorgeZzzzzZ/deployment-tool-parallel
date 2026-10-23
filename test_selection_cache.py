@@ -228,6 +228,7 @@ class SelectionCacheTests(unittest.TestCase):
 
                 branch2 = self.tool.param_vars["GIT_BRANCH2"][1]
                 self.assertEqual(branch2.values(), choices)
+                self.assertEqual(self.tool.param_vars["GIT_BRANCH"][1].values(), choices)
                 self.assertEqual(self.tool._get_param_value("GIT_BRANCH2"), current)
                 self.assertEqual(self.tool._get_param_value("GIT_BRANCH"), "origin/main")
                 self.assertEqual(self.tool.param_vars["folderName"][1].text(), "keep-me")
@@ -246,6 +247,77 @@ class SelectionCacheTests(unittest.TestCase):
                 self.assertEqual(self.tool.param_vars["GIT_BRANCH2"][1].values(), choices)
                 self.assertEqual(self.tool._get_param_value("GIT_BRANCH2"), current)
 
+    def select_shared_branches(self):
+        params = [{"name": "GIT_BRANCH2", "type": "StringParameterDefinition",
+                   "choices": ["origin/outdated-secondary-cache"],
+                   "defaultParameterValue": {"value": ""}}] + copy.deepcopy(PARAMETERS)
+        self.client.get_parameters.side_effect = lambda _, **kwargs: copy.deepcopy(params)
+        self.select()
+        self.drain()
+        return self.tool.param_vars["GIT_BRANCH"][1], self.tool.param_vars["GIT_BRANCH2"][1]
+
+    def test_shared_branch_initial_choices_and_single_refresh_button(self):
+        primary, secondary = self.select_shared_branches()
+        self.assertEqual(secondary.values(), primary.values())
+        self.assertEqual(secondary.currentText(), "")
+        self.assertIs(self.tool.param_refresh_buttons["GIT_BRANCH"],
+                      self.tool.param_refresh_buttons["GIT_BRANCH2"])
+        self.assertEqual(len(set(self.tool.param_refresh_buttons.values())), 1)
+
+    def test_shared_refresh_fetches_once_preserves_edits_and_updates_both_caches(self):
+        primary, secondary = self.select_shared_branches()
+        for primary_value, secondary_value in (("custom-main", "f-case451-423-449"), ("", "")):
+            with self.subTest(values=(primary_value, secondary_value)):
+                primary.setCurrentText(primary_value)
+                secondary.setCurrentText(secondary_value)
+                self.tool.param_vars["folderName"][1].setText("keep-me")
+                choices = ["origin/main", "origin/f-case451-423-449", "origin/new"]
+                self.client.get_git_parameter_choices = Mock(return_value=choices)
+                self.tool.refresh_branch_choices("GIT_BRANCH2")
+                self.tool.refresh_branch_choices("GIT_BRANCH")
+                self.assertEqual(len(self.pending), 1)
+                self.assertFalse(self.tool.param_refresh_buttons["GIT_BRANCH"].isEnabled())
+                self.drain()
+                self.client.get_git_parameter_choices.assert_called_once_with(
+                    "https://jenkins.example/job/service/", "GIT_BRANCH")
+                for widget, value in ((primary, primary_value), (secondary, secondary_value)):
+                    self.assertEqual(widget.values(), choices)
+                    self.assertEqual(widget.currentText(), value)
+                    widget.completer().setCompletionPrefix("451-423")
+                    self.assertEqual(widget.completer().completionCount(), 1)
+                cached = self.tool._cached_parameters(self.tool._displayed_parameter_key)
+                for param in cached:
+                    if param["name"] in ("GIT_BRANCH", "GIT_BRANCH2"):
+                        self.assertEqual(param["choices"], choices)
+                self.assertEqual(self.tool.param_vars["folderName"][1].text(), "keep-me")
+                self.assertTrue(self.tool.param_refresh_buttons["GIT_BRANCH"].isEnabled())
+                self.assertEqual(self.tool.loading_count, 0)
+
+    def test_shared_refresh_failure_keeps_both_lists_and_values(self):
+        primary, secondary = self.select_shared_branches()
+        primary.setCurrentText("origin/main")
+        secondary.setCurrentText("custom-branch")
+        before = [widget.values() for widget in (primary, secondary)]
+        self.client.get_git_parameter_choices = Mock(side_effect=RuntimeError("fixture failure"))
+        self.tool.refresh_branch_choices("GIT_BRANCH2")
+        self.drain()
+        self.assertEqual([widget.values() for widget in (primary, secondary)], before)
+        self.assertEqual((primary.currentText(), secondary.currentText()), ("origin/main", "custom-branch"))
+        self.assertTrue(self.tool.param_refresh_buttons["GIT_BRANCH"].isEnabled())
+        self.assertEqual(self.tool.loading_count, 0)
+        self.tool.message_overlay.show_message.assert_called_once()
+
+    def test_shared_refresh_old_task_response_cannot_replace_new_tasks_lists(self):
+        self.select_shared_branches()
+        self.client.get_git_parameter_choices = Mock(return_value=["origin/old-task-result"])
+        self.tool.refresh_branch_choices("GIT_BRANCH2")
+        self.select("other")
+        self.drain(reverse=True)
+        for name in ("GIT_BRANCH", "GIT_BRANCH2"):
+            self.assertEqual(self.tool.param_vars[name][1].values(), ["origin/main"])
+        self.assertTrue(self.tool.param_refresh_buttons["GIT_BRANCH"].isEnabled())
+        self.assertEqual(self.tool.loading_count, 0)
+
     def test_password_defaults_are_not_added_to_metadata_cache(self):
         self.client.get_parameters.side_effect = None
         self.client.get_parameters.return_value = [
@@ -255,6 +327,97 @@ class SelectionCacheTests(unittest.TestCase):
         self.select()
         self.drain()
         self.assertNotIn("private-default", json.dumps(self.store.data["selection_cache"]))
+
+    def select_custom_name(self, choices=None):
+        params = [{"name": "CUSTOM_NAME", "type": "ChoiceParameterDefinition",
+                   "choices": ["yishen", "hyx"] if choices is None else choices,
+                   "defaultParameterValue": {"value": "yishen"}}] + copy.deepcopy(PARAMETERS)
+        self.client.get_parameters.side_effect = lambda _, **kwargs: copy.deepcopy(params)
+        self.select()
+        self.drain()
+        return self.tool.param_vars["CUSTOM_NAME"][1]
+
+    def test_custom_name_has_refresh_and_retains_saved_value_missing_from_old_cache(self):
+        self.store.data["jenkins"].setdefault("values", {})["service"] = {"CUSTOM_NAME": "hbxx"}
+        widget = self.select_custom_name()
+        self.assertEqual(widget.currentText(), "hbxx")
+        self.assertIn("CUSTOM_NAME", self.tool.param_refresh_buttons)
+        button = self.tool.param_refresh_buttons["CUSTOM_NAME"]
+        self.assertEqual(button.text(), "刷新选项")
+        self.assertIsNot(button, self.tool.param_refresh_buttons["GIT_BRANCH"])
+        self.assertEqual(button.height(), widget.height())
+
+    def test_custom_refresh_reads_latest_choices_once_and_keeps_all_edits(self):
+        widget = self.select_custom_name()
+        self.assertIn("CUSTOM_NAME", self.tool.param_refresh_buttons)
+        button = self.tool.param_refresh_buttons["CUSTOM_NAME"]
+        widget.setCurrentText("hbxx")
+        self.tool.param_vars["folderName"][1].setText("keep-folder")
+        self.tool.param_vars["GIT_BRANCH"][1].setCurrentText("keep-branch")
+        self.client.get_json = Mock(return_value={"property": [{"parameterDefinitions": [
+            {"name": "CUSTOM_NAME", "choices": ["yishen", "hbxx", "hbxx", " new "]},
+        ]}]})
+        button.click()
+        button.click()
+        self.assertEqual(len(self.pending), 1)
+        self.assertFalse(button.isEnabled())
+        self.drain()
+        self.client.get_json.assert_called_once()
+        self.assertEqual(widget.values(), ["yishen", "hbxx", "new"])
+        self.assertEqual(self.tool._get_param_value("CUSTOM_NAME"), "hbxx")
+        widget.completer().setCompletionPrefix("hb")
+        self.assertEqual(widget.completer().completionCount(), 1)
+        self.assertEqual(self.tool.param_vars["folderName"][1].text(), "keep-folder")
+        self.assertEqual(self.tool.param_vars["GIT_BRANCH"][1].currentText(), "keep-branch")
+        cached = self.tool._cached_parameters(self.tool._displayed_parameter_key)
+        self.assertEqual(cached[0]["choices"], ["yishen", "hbxx", "new"])
+        self.assertTrue(button.isEnabled())
+        self.assertEqual(button.text(), "刷新选项")
+        self.assertEqual(self.tool.loading_count, 0)
+
+    def test_custom_refresh_preserves_edits_made_while_request_is_pending(self):
+        widget = self.select_custom_name()
+        self.assertIn("CUSTOM_NAME", self.tool.param_refresh_buttons)
+        self.client.get_json = Mock(return_value={"property": [{"parameterDefinitions": [
+            {"name": "CUSTOM_NAME", "choices": []},
+        ]}]})
+        self.tool.param_refresh_buttons["CUSTOM_NAME"].click()
+        widget.setCurrentText("manual-new-customer")
+        self.drain()
+        self.assertEqual(widget.values(), [])
+        self.assertEqual(widget.currentText(), "manual-new-customer")
+
+    def test_custom_refresh_failure_keeps_existing_choices_and_value(self):
+        widget = self.select_custom_name()
+        self.assertIn("CUSTOM_NAME", self.tool.param_refresh_buttons)
+        widget.setCurrentText("hbxx")
+        self.client.get_json = Mock(side_effect=RuntimeError("fixture offline"))
+        self.tool.param_refresh_buttons["CUSTOM_NAME"].click()
+        self.drain()
+        self.assertEqual(widget.values(), ["yishen", "hyx"])
+        self.assertEqual(widget.currentText(), "hbxx")
+        self.assertTrue(self.tool.param_refresh_buttons["CUSTOM_NAME"].isEnabled())
+        self.assertEqual(self.tool.loading_count, 0)
+        self.assertIn("选项刷新失败", self.tool.message_overlay.show_message.call_args.args)
+
+    def test_custom_refresh_response_cannot_replace_another_jobs_choices(self):
+        self.select_custom_name()
+        self.assertIn("CUSTOM_NAME", self.tool.param_refresh_buttons)
+        self.client.get_json = Mock(return_value={"property": [{"parameterDefinitions": [
+            {"name": "CUSTOM_NAME", "choices": ["old-job-only"]},
+        ]}]})
+        self.tool.param_refresh_buttons["CUSTOM_NAME"].click()
+        self.select("other")
+        self.drain(reverse=True)
+        self.assertEqual(self.tool.param_vars["CUSTOM_NAME"][1].values(), ["yishen", "hyx"])
+        self.assertEqual(self.tool.loading_count, 0)
+
+    def test_empty_custom_name_list_still_offers_refresh_and_manual_input(self):
+        widget = self.select_custom_name(choices=[])
+        self.assertIn("CUSTOM_NAME", self.tool.param_refresh_buttons)
+        self.assertIsInstance(widget, main.SearchableComboBox)
+        widget.setCurrentText("hbxx")
+        self.assertEqual(self.tool._get_param_value("CUSTOM_NAME"), "hbxx")
 
     def test_manual_tree_refresh_failure_keeps_existing_parameters(self):
         self.select()
@@ -381,6 +544,34 @@ class SelectionCacheTests(unittest.TestCase):
         self.assertIn("GIT_BRANCH", self.tool.param_vars)
         self.assertEqual(self.tool.build_cloud_type.currentText(), "etm 后端")
         self.tool.message_overlay.show_message.assert_called()
+
+
+class ParameterChoiceClientTests(unittest.TestCase):
+    def test_choice_refresh_uses_current_job_url_and_never_fetches_git_branches(self):
+        client = main.JenkinsClient("https://jenkins.example", "fixture", "fixture")
+        client.get_json = Mock(return_value={"property": [{"parameterDefinitions": [
+            {"name": "GIT_BRANCH", "choices": ["origin/main"]},
+            {"name": "CUSTOM_NAME", "choices": ["yishen", "hbxx"]},
+        ]}]})
+        client.get_git_parameter_choices = Mock(side_effect=AssertionError("must not query Git"))
+        self.assertEqual(client._get_parameter_choices(["display-name"], "CUSTOM_NAME",
+                         job_url="https://jenkins.example/job/actual-job/"), ["yishen", "hbxx"])
+        client.get_json.assert_called_once_with("https://jenkins.example/job/actual-job/api/json", {
+            "tree": "property[parameterDefinitions[name,choices]]"})
+        client.get_git_parameter_choices.assert_not_called()
+
+    def test_missing_or_invalid_choice_list_is_an_error_and_empty_list_is_valid(self):
+        client = main.JenkinsClient("https://jenkins.example", "fixture", "fixture")
+        for definitions in ([], [{"name": "CUSTOM_NAME"}],
+                            [{"name": "CUSTOM_NAME", "choices": None}],
+                            [{"name": "CUSTOM_NAME", "choices": "hbxx"}]):
+            with self.subTest(definitions=definitions):
+                client.get_json = Mock(return_value={"property": [{"parameterDefinitions": definitions}]})
+                with self.assertRaises(RuntimeError):
+                    client._get_parameter_choices(["service"], "CUSTOM_NAME")
+        client.get_json.return_value = {"property": [{"parameterDefinitions": [
+            {"name": "CUSTOM_NAME", "choices": []}]}]}
+        self.assertEqual(client._get_parameter_choices(["service"], "CUSTOM_NAME"), [])
 
 
 if __name__ == "__main__":

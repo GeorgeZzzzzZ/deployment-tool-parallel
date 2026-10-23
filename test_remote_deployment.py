@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from core import update_yaml_image, yaml_image_reference
+from task_diagnostics import trace_event, trace_stage, trace_operation, RemoteTransferTrace
 
 
 def load_deployment_code():
@@ -35,12 +36,14 @@ def load_deployment_code():
         "BatchDeploymentCoordinator", "exception_message", "ANSI_ESCAPE_RE",
         "TRANSFER_PROGRESS_RE", "clean_remote_output_line", "_transfer_bytes",
         "parse_transfer_progress", "format_transfer_bytes", "DockerImageProgress",
+        "_yaml_delete_command", "_deployment_delete_command",
     }
     methods = {
         "_execute_deploy_batch", "_remote_exec", "_quiet_remote_status",
         "_terminate_remote_process_group", "_remote_command_succeeded",
         "_probe_remote_image", "_wait_for_remote_image", "_deployment_target_key",
         "_create_isolated_image_workspace", "_remove_isolated_image_workspace",
+        "_apply_deployment_yaml",
     }
     selected = []
     for node in tree.body:

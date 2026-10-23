@@ -6,7 +6,7 @@ import time
 from urllib.parse import quote, urlsplit
 
 import requests
-from core import infer_cloud_deployment_config
+from core import IMAGE_REF_RE, infer_cloud_deployment_config
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -353,6 +353,116 @@ class OpsApiClient:
                 f'{settings.get("region")}'
             )
         return target
+
+    @staticmethod
+    def _check_environment_cancelled(cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("环境查询已取消")
+
+    def _current_package_target(self, settings, cancel_event=None):
+        values = [settings.get(key) for key in ("project", "deploy_type", "cloud", "region")]
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise OpsApiError("查询环境包号前请选择专案、服务类型、云厂商和区域")
+        project, deploy_type, cloud, region = [value.strip() for value in values]
+        app = project.lower()
+        type_id = service_type_id(deploy_type)
+        self._check_environment_cancelled(cancel_event)
+        groups = self._data(self._bff(
+            "POST", f"/api/v1/deployment/data/app/group/multi?cloud={quote(cloud, safe='')}",
+            json={"apps": [app]}, timeout=60,
+        ))
+        self._check_environment_cancelled(cancel_event)
+        if not isinstance(groups, list) or any(not isinstance(row, dict) for row in groups):
+            raise OpsApiError("Ops 部署分组数据格式无效")
+
+        candidates = []
+        queried = set()
+        for group in groups:
+            self._check_environment_cancelled(cancel_event)
+            if (str(group.get("appId", "")).lower() != app
+                    or str(group.get("typeId", "")).lower() != type_id):
+                continue
+            deployment_name = str(group.get("deploymentName") or "").strip()
+            if not deployment_name or deployment_name in queried:
+                continue
+            queried.add(deployment_name)
+            self._check_environment_cancelled(cancel_event)
+            payload = self._data(self._bff(
+                "GET", "/api/v1/deployment/data",
+                params={"cloud": cloud, "app": app, "type": type_id,
+                        "deployment_name": deployment_name, "deleted_prod": 0},
+                timeout=60,
+            ))
+            self._check_environment_cancelled(cancel_event)
+            records = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
+                raise OpsApiError("Ops 部署目标数据格式无效")
+            for record in records:
+                self._check_environment_cancelled(cancel_event)
+                if (str(record.get("appId", "")).lower() != app
+                        or str(record.get("typeId", "")).lower() != type_id
+                        or str(record.get("deploymentName", "")) != deployment_name
+                        or str(record.get("cloud", cloud)).lower() != cloud.lower()
+                        or str(record.get("deleted_prod", "0")) != "0"):
+                    continue
+                # Expand one row at a time: option-list deduplication would hide
+                # two distinct deployment units with the same visible region.
+                for target in target_regions([record], cloud):
+                    if target["region"] != region:
+                        continue
+                    if target["state"] == "pre" and str(record.get("deleted_pre", "0")) != "0":
+                        continue
+                    candidates.append(target)
+        description = f"{project} / {deploy_type} / {cloud} / {region}"
+        if not candidates:
+            raise OpsApiError(f"未找到精确部署目标：{description}")
+        if len(candidates) != 1:
+            raise OpsApiError(f"匹配到多个部署目标，无法确定当前运行镜像：{description}")
+        target = candidates[0]
+        if target.get("id") in (None, ""):
+            raise OpsApiError("Ops 部署目标缺少唯一标识")
+        return {
+            key: target[key] for key in (
+                "id", "appId", "typeId", "deploymentName", "cloud", "area",
+                "region", "region_label", "api_area", "state",
+            )
+        }
+
+    def load_current_packages(self, settings, cancel_event=None):
+        """Read the selected Ops runtime image, independently of option caches."""
+        self._check_environment_cancelled(cancel_event)
+        target = self._current_package_target(settings, cancel_event=cancel_event)
+        self._check_environment_cancelled(cancel_event)
+        payload = self._data(self._bff(
+            "GET", "/api/v3/deployment/record",
+            params={"data_id": target["id"], "cloud": target["cloud"], "state": target["state"]},
+            timeout=60,
+        ))
+        self._check_environment_cancelled(cancel_event)
+        records = payload.get("data") if isinstance(payload, dict) else payload
+        hint = records[0].get("imageName") if (
+            isinstance(records, list) and records and isinstance(records[0], dict)
+        ) else None
+        if not isinstance(hint, str) or not IMAGE_REF_RE.fullmatch(hint):
+            raise OpsApiError("Ops 未返回实例查询所需的完整镜像名，无法确认当前运行包")
+        # The Ops frontend's getK8sInstance uses a record only as a lookup hint.
+        # Its getInstance assigns data.registry to runImageName. Never substitute
+        # the history hint when the runtime query has no complete image reference.
+        source = "/api/v3/deployment/instance/data"
+        self._check_environment_cancelled(cancel_event)
+        runtime = self._data(self._bff(
+            "GET", source,
+            params={"cloud": target["cloud"], "area": target["area"],
+                    "app_id": target["appId"], "type": target["typeId"],
+                    "deployment_name": target["deploymentName"], "state": target["state"],
+                    "image_name": hint},
+            timeout=60,
+        ))
+        self._check_environment_cancelled(cancel_event)
+        image = runtime.get("registry") if isinstance(runtime, dict) else None
+        if not isinstance(image, str) or not IMAGE_REF_RE.fullmatch(image):
+            raise OpsApiError("Ops 未返回完整镜像引用，无法确认当前运行镜像；不会使用部署历史替代")
+        return {"packages": [image], "target": target, "source": source}
 
     def verify_package(self, target, package):
         image_name, separator, tag = str(package).partition(":")

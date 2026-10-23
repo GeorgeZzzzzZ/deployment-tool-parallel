@@ -17,6 +17,13 @@ PARAMETERS = [
      "defaultParameterValue": {"value": "app_backend"}},
 ]
 
+SSH_PARAMETERS = [
+    {"name": "CUSTOM_NAME", "type": "ChoiceParameterDefinition",
+     "choices": ["sample", "hbxx"], "defaultParameterValue": {"value": "hbxx"}},
+    {"name": "GIT_BRANCH2", "type": "StringParameterDefinition",
+     "defaultParameterValue": {"value": ""}},
+] + PARAMETERS
+
 
 def summary(number=6, building=False):
     return {
@@ -190,6 +197,70 @@ class BuildSummaryInterfaceTests(unittest.TestCase):
         self.assertEqual(self.tool.branch_summary_layout.count(), 3)
         self.tool._show_parameters(["empty"], [])
         self.assertEqual(self.tool.branch_summary_layout.count(), 0)
+
+    def test_ssh_and_cloud_switches_move_same_fields_and_shared_refresh(self):
+        self.tool._show_parameters(["service"], SSH_PARAMETERS)
+        fields = {name: value[1] for name, value in self.tool.param_vars.items()}
+        fields["CUSTOM_NAME"].setCurrentText("manual-customer")
+        fields["GIT_BRANCH2"].setCurrentText("feature/secondary")
+        button = self.tool.param_refresh_buttons["GIT_BRANCH"]
+        for mode in ("云端部署", "SSH 环境部署", "云端部署", "SSH 环境部署"):
+            self.tool.build_deploy_mode.blockSignals(True)
+            self.tool.build_deploy_mode.setCurrentText(mode)
+            self.tool.build_deploy_mode.blockSignals(False)
+            self.tool._apply_build_deploy_mode(mode, prompt_for_account=False, refresh_cloud=False)
+            self.app.processEvents()
+            ssh = mode == "SSH 环境部署"
+            self.assertFalse(self.tool.params_card._toggle.isChecked())
+            self.assertEqual(fields["CUSTOM_NAME"].isVisible(), ssh)
+            self.assertEqual(fields["GIT_BRANCH2"].isVisible(), ssh)
+            self.assertEqual(fields["GIT_BRANCH"].isVisible(), not ssh)
+            branch = fields["GIT_BRANCH2" if ssh else "GIT_BRANCH"]
+            self.assertIs(button.parentWidget(), branch.parentWidget())
+            self.assertTrue(button.isVisible())
+            self.assertEqual(fields["CUSTOM_NAME"].currentText(), "manual-customer")
+            self.assertEqual(fields["GIT_BRANCH2"].currentText(), "feature/secondary")
+            self.tool.params_card.set_expanded(not ssh)
+        self.tool.params_card.set_expanded(True)
+        self.tool._apply_build_deploy_mode("SSH 环境部署", prompt_for_account=False)
+        self.assertTrue(self.tool.params_card._toggle.isChecked())
+
+    def test_collapsed_customer_and_secondary_branch_are_submitted_and_fallback_is_preserved(self):
+        self.select("custom-dev")
+        self.drain()
+        self.tool._show_parameters(self.tool.current_job_path, SSH_PARAMETERS)
+        self.tool.param_vars["CUSTOM_NAME"][1].setCurrentText("manual-customer")
+        self.tool.deploy_after_build_checkbox.setChecked(False)
+        with patch.object(main.DeployTool, "_launch_build") as launch:
+            for branch in ("feature/secondary", ""):
+                self.tool.param_vars["GIT_BRANCH2"][1].setCurrentText(branch)
+                self.tool.start_build()
+                params = launch.call_args.args[1]["configuration"]["params"]
+                self.assertEqual(params["CUSTOM_NAME"], "manual-customer")
+                self.assertEqual(params["GIT_BRANCH2"], branch or "origin/master")
+                self.assertEqual(params["GIT_BRANCH"], "origin/master")
+                self.assertEqual(params["folderName"], "app_backend")
+                self.assertFalse(self.tool.params_card._toggle.isChecked())
+
+    def test_compact_refresh_updates_sources_without_resetting_or_expanding(self):
+        self.select()
+        self.drain()
+        self.tool._show_parameters(self.tool.current_job_path, SSH_PARAMETERS)
+        self.tool.param_vars["CUSTOM_NAME"][1].setCurrentText("manual-customer")
+        self.tool.param_vars["GIT_BRANCH2"][1].setCurrentText("feature/secondary")
+        self.client._get_parameter_choices = Mock(return_value=["hbxx", "new-customer"])
+        self.client.get_git_parameter_choices = Mock(return_value=["origin/main", "origin/new"])
+        for name in ("CUSTOM_NAME", "GIT_BRANCH2"):
+            self.tool.param_refresh_buttons[name].click()
+            self.drain()
+        self.client._get_parameter_choices.assert_called_once()
+        self.client.get_git_parameter_choices.assert_called_once()
+        self.assertEqual(self.tool.param_vars["CUSTOM_NAME"][1].values(), ["hbxx", "new-customer"])
+        for name in ("GIT_BRANCH", "GIT_BRANCH2"):
+            self.assertEqual(self.tool.param_vars[name][1].values(), ["origin/main", "origin/new"])
+        self.assertEqual(self.tool._get_param_value("CUSTOM_NAME"), "manual-customer")
+        self.assertEqual(self.tool._get_param_value("GIT_BRANCH2"), "feature/secondary")
+        self.assertFalse(self.tool.params_card._toggle.isChecked())
 
     def test_freestyle_summary_displays_changes_branch_and_revision_as_plain_text(self):
         self.select_built()

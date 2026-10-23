@@ -103,6 +103,152 @@ class UiRegressionTests(unittest.TestCase):
                     point = entry.mapTo(scroll.viewport(), entry.rect().center())
                     self.assertTrue(scroll.viewport().rect().contains(point))
 
+    def test_build_environment_actions_fit_and_align_right(self):
+        self.task.build_env_card.set_expanded(True)
+        for width in (1080, 1440):
+            self.manager.resize(width, 850)
+            self.app.processEvents()
+            buttons = {button.text(): button for button in self.task.build_env_card.findChildren(main.QPushButton)}
+            save, refresh = buttons["保存环境配置"], buttons["刷新"]
+            for button in (save, refresh):
+                self.assertGreaterEqual(button.height(), button.minimumSizeHint().height())
+                self.assertGreaterEqual(button.width(), button.minimumSizeHint().width())
+                self.assertTrue(button.parentWidget().rect().contains(button.geometry()))
+            self.assertGreater(save.x(), save.parentWidget().width() // 2)
+            self.assertLess(save.geometry().right(), refresh.x())
+            self.assertLessEqual(refresh.parentWidget().width() - refresh.geometry().right(), 2)
+
+    def test_delete_apply_option_fits_requested_positions_at_both_widths(self):
+        for width in (1080, 1440):
+            self.manager.resize(width, 960)
+            self.task.tab_widget.setCurrentIndex(0)
+            for expanded in (False, True, False):
+                self.task.build_env_card.set_expanded(expanded)
+                self.app.processEvents()
+                card = self.task.build_env_card
+                option = self.task.build_delete_option
+                point = option.checkbox.mapTo(card, main.QPoint())
+                self.assertTrue(card.rect().contains(point))
+                if expanded:
+                    self.assertLess(point.x(), card.width() // 2)
+                else:
+                    self.assertGreater(point.x(), card.width() // 2)
+                self.assertLess(card._toggle.mapTo(card, main.QPoint()).x(), 40)
+                self.assertTrue(option.checkbox.parentWidget().rect().contains(option.checkbox.geometry()))
+                self.assertGreaterEqual(option.checkbox.width() - option.checkbox.TEXT_X,
+                                        option.checkbox.fontMetrics().horizontalAdvance(option.checkbox.text()))
+                if expanded:
+                    self.assertLess(option.checkbox.geometry().right(), option.command.x())
+                    self.assertGreater(option.command.width(), 100)
+                    self.assertTrue(option.rect().contains(option.command.geometry()))
+            self.task.tab_widget.setCurrentIndex(1)
+            self.app.processEvents()
+            option = self.task.deploy_delete_option
+            container = option.parentWidget()
+            self.assertGreater(option.x(), container.width() * 0.4)
+            self.assertTrue(container.rect().contains(option.geometry()))
+            self.assertLess(option.checkbox.geometry().right(), option.command.x())
+            self.assertGreater(option.command.width(), 100)
+            self.assertTrue(option.rect().contains(option.command.geometry()))
+
+    def test_environment_trace_region_can_be_clicked_before_selecting_job(self):
+        self.task.cloud_username.setText("fixture-user")
+        self.task.cloud_password.setText("fixture-password")
+        settings = self.task._cloud_settings_from_ui()
+        for project in ("", "etm"):
+            self.task._save_selection_cache("cloud_targets", self.task._cloud_options_cache_key(
+                {**settings, "project": project}), {
+                    "projects": ["etm"], "project": project, "types": ["etm 后端"] if project else [],
+                    "regions_by_type": {"etm 后端": ["Huawei / 测试", "Huawei / 正式"]} if project else {},
+                }, save=False)
+        self.task.tab_widget.setCurrentIndex(3)
+        self.task.trace_mode.setCurrentText("环境溯源")
+        self.app.processEvents()
+        region = self.task.trace_region
+        self.assertTrue(region.isEnabled())
+        QTest.mouseClick(region, main.Qt.LeftButton, pos=region.rect().center())
+        self.app.processEvents()
+        self.assertTrue(region.view().isVisible())
+        index = region.model().index(region.findText("Huawei / 正式"), 0)
+        QTest.mouseMove(region.view().viewport(), region.view().visualRect(index).center())
+        QTest.mouseClick(region.view().viewport(), main.Qt.LeftButton,
+                         pos=region.view().visualRect(index).center())
+        self.app.processEvents()
+        self.assertEqual(region.currentText(), "Huawei / 正式")
+        self.assertEqual(self.task._trace_job_path, [])
+
+    def test_secondary_branches_share_one_visible_refresh_button(self):
+        self.task._show_parameters(["custom-dev", "etm"], [
+            {"name": "CUSTOM_NAME", "type": "ChoiceParameterDefinition",
+             "choices": ["yishen", "hbxx"], "defaultParameterValue": {"value": "hbxx"},
+             "description": "yishen-示例\nhyx-示例\nthj-示例\nfydl-示例\nyzgd-示例\nbmgd-示例\nhbxx-示例"},
+            {"name": "GIT_BRANCH2", "type": "StringParameterDefinition",
+             "defaultParameterValue": {"value": ""}},
+            {"name": "GIT_BRANCH", "type": "GitParameterDefinition",
+             "choices": ["origin/main", "origin/f-case451-423-449"],
+             "defaultParameterValue": {"value": "origin/main"}},
+        ])
+        primary = self.task.param_vars["GIT_BRANCH"][1]
+        secondary = self.task.param_vars["GIT_BRANCH2"][1]
+        customer = self.task.param_vars["CUSTOM_NAME"][1]
+        button = self.task.param_refresh_buttons["GIT_BRANCH"]
+        secondary.setCurrentText("f-case451-423-449")
+        self.assertFalse(self.task.params_card._toggle.isChecked())
+        for width in (1080, 1440):
+            compact_geometry = None
+            for expanded in (False, True, False):
+                self.manager.resize(width, 960)
+                self.task.params_card.set_expanded(expanded)
+                self.app.processEvents()
+                visible = [item for item in self.task.findChildren(main.QPushButton)
+                           if item.text() == "刷新分支" and item.isVisible()]
+                self.assertEqual(visible, [button])
+                self.assertEqual(primary.isVisible(), expanded)
+                self.assertTrue(secondary.isVisible())
+                self.assertTrue(customer.isVisible())
+                self.assertTrue(self.task.param_refresh_buttons["CUSTOM_NAME"].isVisible())
+                self.assertEqual(secondary.currentText(), "f-case451-423-449")
+                self.assertEqual(customer.currentText(), "hbxx")
+                self.assertGreaterEqual(button.width(), button.minimumSizeHint().width())
+                self.assertEqual(button.mapToGlobal(main.QPoint()).y(), secondary.mapToGlobal(main.QPoint()).y())
+                self.assertTrue(button.parentWidget().rect().contains(button.geometry()))
+                if expanded:
+                    self.assertEqual(primary.width(), secondary.width())
+                    bottom = primary.mapToGlobal(main.QPoint()).y() + primary.height()
+                    self.assertEqual(button.mapToGlobal(main.QPoint()).y() + button.height(), bottom)
+                    self.assertGreater(button.mapToGlobal(main.QPoint()).x(), secondary.mapToGlobal(main.QPoint()).x() + secondary.width())
+                else:
+                    self.assertEqual(button.height(), secondary.height())
+                    self.assertLess(self.task.params_card.height(), 200)
+                    self.assertLess(customer.mapToGlobal(main.QPoint()).y(), secondary.mapToGlobal(main.QPoint()).y())
+                    geometry = (self.task.params_card.size(), customer.size(), secondary.size(), button.size())
+                    if compact_geometry is not None:
+                        self.assertEqual(geometry, compact_geometry)
+                    compact_geometry = geometry
+                with patch.object(self.task, "refresh_branch_choices") as refresh:
+                    QTest.mouseClick(button, main.Qt.LeftButton,
+                                     pos=main.QPoint(button.width() // 2, button.height() - 4))
+                    refresh.assert_called_once_with("GIT_BRANCH")
+
+    def test_custom_name_refresh_fits_to_right_of_selector(self):
+        self.task._show_parameters(["service"], [
+            {"name": "CUSTOM_NAME", "type": "ChoiceParameterDefinition",
+             "choices": ["yishen", "hbxx"], "defaultParameterValue": {"value": "hbxx"}},
+        ])
+        self.task.params_card.set_expanded(True)
+        widget = self.task.param_vars["CUSTOM_NAME"][1]
+        button = self.task.param_refresh_buttons["CUSTOM_NAME"]
+        for width in (1080, 1440):
+            self.manager.resize(width, 960)
+            self.app.processEvents()
+            self.assertTrue(button.isVisible())
+            self.assertEqual(button.text(), "刷新选项")
+            self.assertEqual(button.height(), widget.height())
+            self.assertGreaterEqual(button.width(), button.minimumSizeHint().width())
+            self.assertTrue(button.parentWidget().rect().contains(button.geometry()))
+            self.assertGreater(button.x(), widget.geometry().right())
+            self.assertEqual(button.y(), widget.y())
+
     def test_login_button_requests_visible_browser_and_blocks_reentry(self):
         self.task.cloud_url.setText("https://example.invalid/cdm/deployment/flow-deploy")
         self.task.cloud_username.setText("test-user")

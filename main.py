@@ -59,6 +59,7 @@ from core import (
     infer_ssh_deployment_config,
     is_secondary_build_path,
     jenkins_job_api_url,
+    parse_deployment_packages,
     reorder_parameters,
     rename_bound_dashboard,
     resolve_ssh_environment_for_package,
@@ -72,6 +73,11 @@ from ops_api import (
 )
 from package_trace import (
     JenkinsHistorySource, format_trace_match, parse_packages, trace_packages, trace_result_fields,
+    job_service_type, TraceCancelled,
+)
+from task_diagnostics import (
+    configure_diagnostics, shutdown_diagnostics, diagnostics_status, new_task_trace,
+    trace_event, trace_stage, trace_operation, RemoteTransferTrace,
 )
 
 # ── Color Palette (Glassmorphism / Frosted Glass / Modern SaaS) ─────
@@ -249,6 +255,25 @@ DEFAULT_DEPLOY = {
     "yaml_file": "etm.yaml",
     "apply_command": "kubectl apply -f etm.yaml",
 }
+
+
+def _yaml_delete_command(yaml_file):
+    filename = str(yaml_file or "").strip()
+    if not filename:
+        raise ValueError("未选择 YAML 文件，无法生成删除命令")
+    return f"kubectl delete -f {shell_quote(filename)} --ignore-not-found=true --timeout=120s"
+
+
+def _deployment_delete_command(data):
+    command = data.get("delete_command")
+    if command is None:
+        return _yaml_delete_command(data["yaml_file"])
+    target = data.get("delete_command_target")
+    if target and tuple(target) != (data["yaml_dir"], data["yaml_file"]):
+        raise ValueError("删除命令对应的 YAML 与当前部署目标不一致，请重新核对包号和删除命令")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("已开启删除后重新应用，请填写删除命令，或关闭该开关")
+    return command.strip()
 
 
 ENVIRONMENT_FIELDS = [
@@ -768,6 +793,7 @@ class ConfigStore:
             "environments": [],
             "dashboards": [],
             "last_package": "",
+            "delete_before_apply": False,
         }
 
     @classmethod
@@ -1305,6 +1331,21 @@ class JenkinsClient:
         return [item["value"] for item in data.get("values", []) if item.get("value")]
 
     get_git_parameter_choices = _get_git_parameter_choices
+
+    def _get_parameter_choices(self, path, name, *, job_url=""):
+        """Read one ordinary choice list without querying Git branch plugins."""
+        job_url = job_url.rstrip("/") or jenkins_job_api_url(self.url, path)
+        data = self.get_json(job_url + "/api/json", {
+            "tree": "property[parameterDefinitions[name,choices]]",
+        })
+        for prop in data.get("property", []):
+            for parameter in prop.get("parameterDefinitions", []):
+                if parameter.get("name") == name:
+                    choices = parameter.get("choices")
+                    if not isinstance(choices, list):
+                        raise RuntimeError(f"Jenkins 未返回 {name} 的候选列表，请检查任务参数配置")
+                    return choices
+        raise RuntimeError(f"Jenkins 当前任务中未找到参数 {name}")
 
     def _crumb_headers(self):
         try:
@@ -2273,6 +2314,81 @@ class CollapsibleCardWidget(CardWidget):
         self.expanded_changed.emit(expanded)
 
 
+class DeploymentPackageInput(QPlainTextEdit):
+    returnPressed = Signal()
+    editingFinished = Signal()
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setTabChangesFocus(True)
+        self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.textChanged.connect(self._resize_to_lines)
+        self.setText(text)
+
+    def text(self):
+        return self.toPlainText()
+
+    def setText(self, text):
+        self.setPlainText(text)
+        self.setModified(False)
+
+    def isModified(self):
+        return self.document().isModified()
+
+    def setModified(self, modified):
+        self.document().setModified(modified)
+
+    def _resize_to_lines(self):
+        lines = min(4, max(1, self.document().blockCount()))
+        self.setFixedHeight(max(44, lines * self.fontMetrics().lineSpacing() + 32))
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not event.modifiers() & Qt.ShiftModifier:
+            self.returnPressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.editingFinished.emit()
+
+
+class DeleteApplyOption(QWidget):
+    """One task option with a visible command, reusable on both SSH pages."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.checkbox = ToggleSwitch("删除后重新应用")
+        self.checkbox.setFixedWidth(168)
+        self.checkbox.setAccessibleName("部署前删除当前 YAML 资源后重新应用")
+        layout.addWidget(self.checkbox)
+        self.command = QLineEdit()
+        self.command.setAccessibleName("删除命令（可编辑，随 YAML 自动匹配）")
+        self.command.setMinimumWidth(0)
+        self.command.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        layout.addWidget(self.command, 1)
+
+    def set_compact(self, compact):
+        self.command.setVisible(not compact)
+
+    def set_target(self, directory, filename, command=None):
+        if command is None:
+            command = _yaml_delete_command(filename) if filename.strip() else ""
+        self.command.setPlaceholderText("请先选择 YAML 文件" if not filename.strip() else "请输入删除命令")
+        if self.command.text() != command:
+            self.command.setText(command)
+            self.command.setCursorPosition(0)
+        self.setToolTip(
+            "自动记住开关状态。开启后会删除当前 YAML 中的资源再应用，期间服务可能短暂中断。\n"
+            f"目录：{directory}\n{command}"
+        )
+        self.command.setToolTip(f"可编辑；本次任务按环境和 YAML 保留修改，部署时执行此命令。\n目录：{directory}\n{command}")
+
+
 class StatusBadge(QFrame):
     """A small rounded badge for status indicators."""
 
@@ -3008,6 +3124,7 @@ class DeployTool(QMainWindow):
     sig_branch_refresh_error = Signal(object)
     sig_build_summary = Signal(object)
     sig_package_trace = Signal(object)
+    sig_trace_regions = Signal(object)
 
     def __init__(
         self, store=None, window_manager=None, task_number=1, embedded=False
@@ -3061,8 +3178,12 @@ class DeployTool(QMainWindow):
         self._running_summary_build_url = ""
         self._trace_request = None
         self._trace_report = None
+        self._trace_environment_summary = ""
         self._trace_job_path = []
+        self._trace_display_path = []
         self._trace_job_client = None
+        self._trace_region_request = None
+        self._trace_cloud = self.store.data.get("cloud_deploy", {}).get("cloud") or "Huawei"
         self.dashboard_drivers = []
         self.cloud_driver = None
         self.ops_api = None
@@ -3070,6 +3191,10 @@ class DeployTool(QMainWindow):
         self._ops_login_lock = threading.Lock()
         self._cloud_option_requests = {"build": 0, "tab": 0}
         self._selected_module_path = []
+        self._preview_ssh_target = None
+        self.delete_before_apply = self.store.data.get("delete_before_apply") is True
+        self._delete_options = []
+        self._delete_command_overrides = {}
         self.cloud_project_names = []
         self.cloud_options_loading = False
         self._cloud_login_in_progress = False
@@ -3150,10 +3275,15 @@ class DeployTool(QMainWindow):
         self.sig_branch_refresh_error.connect(self._on_branch_refresh_error)
         self.sig_build_summary.connect(self._on_build_summary)
         self.sig_package_trace.connect(self._on_package_trace)
+        self.sig_trace_regions.connect(self._on_trace_regions)
 
     # ── Emit helpers (thread-safe via signals) ─────────────────────
     def emit(self, target, payload=None):
         """Legacy emit bridge: maps string event names to typed signals."""
+        if target == "pipeline_location" and payload:
+            trace_event(self, "pipeline_phase", phase=payload[0])
+        elif target == "package":
+            trace_event(self, "package_identified", package=payload)
         sig_map = {
             "build_log": lambda: self.sig_build_log.emit(payload),
             "deploy_log": lambda: self.sig_deploy_log.emit(payload),
@@ -3210,6 +3340,10 @@ class DeployTool(QMainWindow):
             manager.update_task(self)
 
     def _begin_tracked_task(self, kind, target, package="", title=""):
+        self._diagnostics = new_task_trace(
+            getattr(self, "task_number", 0), kind=kind, target=target,
+            package=package, title=title,
+        )
         self._last_build_snapshot = None
         self._task_runtime_active = True
         self._task_state = "running"
@@ -3241,6 +3375,8 @@ class DeployTool(QMainWindow):
                 self._task_phase = "执行完成"
         self._task_runtime_active = False
         self._task_finished_at = time.monotonic()
+        if getattr(self, "_diagnostics", None) is not None:
+            self._diagnostics.finish(self._task_state)
         self._notify_task_summary()
 
     def _finish_standalone_task(self):
@@ -3336,28 +3472,28 @@ class DeployTool(QMainWindow):
             self.cloud_package.setText(pkg)
         self.store.data["last_package"] = pkg
         self.store.save()
+        configuration = (getattr(self, "_last_build_snapshot", None) or {}).get("configuration", {})
+        preview = ((configuration.get("environment") or {}).get("_preview_yaml")
+                   or getattr(self, "_preview_ssh_target", None))
         if (
             self.build_running
             and self.active_deploy_after_build
             and hasattr(self, "build_deploy_mode")
             and self.build_deploy_mode.currentText() == "SSH 环境部署"
+            and (not configuration or configuration.get("path") == self.current_job_path)
         ):
             try:
                 ssh_target = infer_ssh_deployment_config(pkg)
+                if preview and any(ssh_target[key] != preview[key] for key in preview):
+                    # The pipeline reports a mismatch and stops before deployment.
+                    # Keep the displayed preview that the user actually approved.
+                    raise ValueError("Package differs from the frozen preview")
             except ValueError:
                 # The pipeline reports the package parsing error with its full
                 # context; leave the currently displayed profile untouched.
                 pass
             else:
-                was_loading = self.loading_environment
-                was_dirty = self.env_dirty
-                self.loading_environment = True
-                try:
-                    for key in ("yaml_dir", "yaml_file", "apply_command"):
-                        self._set_env_var(key, ssh_target[key])
-                finally:
-                    self.loading_environment = was_loading
-                    self.env_dirty = was_dirty
+                DeployTool._apply_ssh_target_fields(self, ssh_target)
                 self.deploy_log.appendPlainText(
                     "已按 Jenkins 最终包号更新界面目标："
                     f'{ssh_target["yaml_dir"]} / {ssh_target["yaml_file"]}'
@@ -3808,6 +3944,7 @@ class DeployTool(QMainWindow):
         )
 
     def _reload_configuration_widgets(self):
+        self._delete_command_overrides.clear()
         saved = self.store.data.get("jenkins", {})
         self.jenkins = None
         self._job_cache_generation += 1
@@ -3844,6 +3981,8 @@ class DeployTool(QMainWindow):
             self.deploy_after_build_checkbox.blockSignals(True)
             self.deploy_after_build_checkbox.setChecked(deploy_after_build)
             self.deploy_after_build_checkbox.blockSignals(False)
+        self._set_delete_before_apply(self.store.data.get("delete_before_apply") is True, persist=False)
+        self._refresh_delete_options()
         mode = saved.get("deploy_mode", "SSH 环境部署")
         if mode not in self.build_deploy_mode.values():
             mode = "SSH 环境部署"
@@ -4251,18 +4390,18 @@ class DeployTool(QMainWindow):
         # Env action buttons row
         env_actions = QHBoxLayout()
         env_actions.setSpacing(8)
+        self.build_delete_option = self._create_delete_apply_option()
+        env_actions.addWidget(self.build_delete_option, 1)
 
         save_env_btn = QPushButton("保存环境配置")
         save_env_btn.setObjectName("PrimaryBtn")
-        save_env_btn.setFixedHeight(34)
+        save_env_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         save_env_btn.clicked.connect(self.save_environment)
-        env_actions.addWidget(save_env_btn)
 
         refresh_env_btn = QPushButton("刷新")
         refresh_env_btn.setObjectName("GhostBtn")
-        refresh_env_btn.setFixedSize(72, 34)
+        refresh_env_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         refresh_env_btn.clicked.connect(self.refresh_environment)
-        env_actions.addWidget(refresh_env_btn)
 
         self.build_remote_status_label = QLabel("")
         self.build_remote_status_label.setStyleSheet(f"""
@@ -4278,8 +4417,22 @@ class DeployTool(QMainWindow):
         self.build_remote_progress.hide()
         env_actions.addWidget(self.build_remote_progress)
 
-        env_actions.addStretch()
+        env_actions.addWidget(save_env_btn)
+        env_actions.addWidget(refresh_env_btn)
         self.build_env_card.content_layout().addLayout(env_actions)
+        self.build_env_actions = env_actions
+        env_header = QWidget()
+        self.build_env_header_layout = QHBoxLayout(env_header)
+        self.build_env_header_layout.setContentsMargins(0, 0, 0, 0)
+        self.build_env_card._layout.removeWidget(self.build_env_card._toggle)
+        self.build_env_header_layout.addWidget(self.build_env_card._toggle, 0, Qt.AlignLeft)
+        self.build_env_header_layout.addStretch(1)
+        self.build_env_card._layout.insertWidget(0, env_header)
+        self.build_env_card.expanded_changed.connect(self._place_build_delete_option)
+        self._place_build_delete_option(self.build_env_card._toggle.isChecked())
+        self.build_yaml_preview_label = QLabel("选择具体任务后自动匹配 YAML；部署前按最终包号校验。")
+        self.build_yaml_preview_label.setWordWrap(True)
+        self.build_env_card.content_layout().addWidget(self.build_yaml_preview_label)
 
         # 云端部署模式专用的目标配置区，SSH 模式下保持隐藏。
         self.build_cloud_card = CollapsibleCardWidget("云端部署目标配置", expanded=True)
@@ -4475,12 +4628,19 @@ class DeployTool(QMainWindow):
         layout = QVBoxLayout(content_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        card = CardWidget("包号溯源")
+        card = CardWidget("溯源查询")
         layout.addWidget(card)
         content = card.content_layout()
-        hint = QLabel("每行一个包号，按产品和服务筛选任务，支持后端、前端和 APP 包。")
-        hint.setWordWrap(True)
-        content.addWidget(hint)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("溯源方式"))
+        self.trace_mode = SearchableComboBox(editable=False)
+        self.trace_mode.set_values(["包号溯源", "环境溯源"])
+        self.trace_mode.setAccessibleName("溯源方式")
+        mode_row.addWidget(self.trace_mode, 1)
+        content.addLayout(mode_row)
+        self.trace_hint = QLabel("每行一个包号，按产品和服务筛选任务，支持后端、前端和 APP 包。")
+        self.trace_hint.setWordWrap(True)
+        content.addWidget(self.trace_hint)
         controls = QHBoxLayout()
         controls.addStretch()
         self.trace_open_button = QPushButton("查看构建")
@@ -4505,6 +4665,19 @@ class DeployTool(QMainWindow):
         )
         self.trace_input.setFixedHeight(74)
         content.addWidget(self.trace_input)
+        self.trace_environment_controls = QWidget()
+        region_row = QHBoxLayout(self.trace_environment_controls)
+        region_row.setContentsMargins(0, 0, 0, 0)
+        region_row.addWidget(QLabel("云区节点"))
+        self.trace_region = SearchableComboBox(editable=False)
+        self.trace_region.setAccessibleName("环境溯源云区节点")
+        self.trace_region.setPlaceholderText("请选择云区节点")
+        region_row.addWidget(self.trace_region, 1)
+        self.trace_region_refresh = QPushButton("刷新云区")
+        self.trace_region_refresh.clicked.connect(lambda: self._load_trace_regions(force=True))
+        region_row.addWidget(self.trace_region_refresh)
+        self.trace_environment_controls.hide()
+        content.addWidget(self.trace_environment_controls)
         content.addLayout(controls)
         jenkins_layout = self.trace_job_panel.content_layout()
         self.trace_job_browser = JenkinsJobBrowser()
@@ -4544,7 +4717,151 @@ class DeployTool(QMainWindow):
         splitter.addWidget(self.trace_details)
         splitter.setSizes([260, 170])
         self.trace_input.textChanged.connect(self._invalidate_package_trace_input)
+        self.trace_region.currentTextChanged.connect(self._invalidate_package_trace_input)
+        self.trace_mode.currentTextChanged.connect(self._on_trace_mode_changed)
+        for field in (self.cloud_url, self.cloud_username, self.cloud_password):
+            field.textChanged.connect(self._invalidate_trace_account)
         self._sync_trace_job_browser()
+
+    def _invalidate_trace_account(self, _text=""):
+        if self.trace_mode.currentText() != "环境溯源":
+            return
+        self._trace_region_request = None
+        self.trace_region.set_values([])
+        self.trace_region.setEnabled(False)
+        self.trace_region_refresh.setEnabled(True)
+        self._invalidate_package_trace_input()
+        self.trace_status.setText("Ops 登录信息已修改，请刷新云区后重新查询。")
+
+    def _on_trace_mode_changed(self, _text=""):
+        environment = self.trace_mode.currentText() == "环境溯源"
+        self.trace_input.setVisible(not environment)
+        self.trace_environment_controls.setVisible(environment)
+        self.trace_job_panel.findChild(QLabel, "CardTitle").setText(
+            "Jenkins 构建任务" if environment else "Jenkins 任务路径（可选）")
+        self.trace_hint.setText(
+            "选择云区节点及左侧具体构建任务，查询该环境当前运行包的 Jenkins 打包来源。"
+            if environment else "每行一个包号，按产品和服务筛选任务，支持后端、前端和 APP 包。")
+        self._trace_region_request = None
+        self._invalidate_package_trace_input()
+        if environment:
+            self._load_trace_regions()
+
+    def _trace_environment_settings(self):
+        product = (extract_job_project_code(self._trace_display_path)
+                   or extract_job_project_code(self._trace_job_path)).lower()
+        service = job_service_type(self._trace_job_path, self._trace_display_path)
+        if not self._trace_job_path or not product or not service:
+            raise ValueError("请在左侧选择可识别产品及 WEB、SERVICE 或 APP 的具体构建任务。")
+        project = product + ("mobile" if service == "mobile" else "")
+        type_id = "frontend" if service == "mobile" else service
+        settings = self._cloud_settings_from_ui()
+        region = self.trace_region.currentText().strip()
+        cloud, region = region.split(" / ", 1) if " / " in region else (self._trace_cloud, region)
+        settings.update(project=project, deploy_type=service_type_label(project, type_id),
+                        cloud=cloud, region=region)
+        return settings
+
+    def _trace_target_identity(self):
+        settings = self._cloud_settings_from_ui()
+        return (self.jenkins, tuple(self._trace_job_path), tuple(self._trace_display_path),
+                settings["url"], settings["username"], settings["password_plain"], self._trace_cloud)
+
+    def _trace_input_identity(self):
+        mode = self.trace_mode.currentText()
+        if mode == "环境溯源":
+            return (mode, self._trace_target_identity(), self.trace_region.currentText())
+        return (mode, self.trace_input.toPlainText().strip())
+
+    def _load_trace_regions(self, *, force=False):
+        if self.trace_mode.currentText() != "环境溯源" or self._trace_request:
+            return
+        previous = self.trace_region.currentText() or (self._trace_region_request or {}).get("previous", "")
+        self._trace_region_request = None
+        self.trace_region.set_values([])
+        self.trace_region.setEnabled(False)
+        self.trace_region_refresh.setEnabled(True)
+        try:
+            settings = self._trace_environment_settings()
+        except ValueError:
+            # Before choosing a job, offer the account's known nodes across services.
+            settings = {**self._cloud_settings_from_ui(), "project": "", "deploy_type": "",
+                        "cloud": self._trace_cloud}
+        if not self._cloud_account_complete(settings):
+            self.trace_status.setText("请先在云端部署页填写 Ops 登录信息，再刷新云区。")
+            return
+        request = {"identity": self._trace_target_identity(), "previous": previous}
+        self._trace_region_request = request
+        cached = None if force else self._cached_cloud_options(settings, "trace")
+        if cached is not None:
+            if settings["project"] and service_type_matches(settings["deploy_type"], cached.get("type", "")):
+                self._on_trace_regions({"request": request, "regions": cached["regions"]})
+                return
+            if not settings["project"]:
+                regions = []
+                for project in cached["projects"]:
+                    project_settings = {**settings, "project": project}
+                    options = self._cached_cloud_options(project_settings, "trace")
+                    if options is not None:
+                        data = self._cached_selection("cloud_targets", self._cloud_options_cache_key(project_settings))
+                        for service in options["types"]:
+                            regions.extend(data["regions_by_type"][service])
+                if regions or not cached["projects"]:
+                    self._on_trace_regions({"request": request, "regions": list(dict.fromkeys(regions))})
+                    return
+        self.trace_region_refresh.setEnabled(False)
+        self.trace_status.setText(f"正在加载 {settings['deploy_type'] or '当前账号'} 的云区节点…")
+
+        def load():
+            event = {"request": request}
+            try:
+                if settings["project"]:
+                    api = self._ensure_cloud_login(settings)
+                    options = api.load_target_options(settings["project"], settings["cloud"], refresh=force)
+                    event["regions"] = list(dict.fromkeys(
+                        target["region_label"] for target in options["targets"]
+                        if service_type_id(target.get("typeId")) == service_type_id(settings["deploy_type"])
+                        and str(target.get("project", settings["project"])).casefold() == settings["project"].casefold()
+                    ))
+                else:
+                    entries, failures = self._collect_cloud_cache(settings, force=force)
+                    event["cache_entries"] = entries
+                    event["regions"] = list(dict.fromkeys(
+                        region for entry in entries.values() for service in entry["types"]
+                        for region in entry["regions_by_type"][service]
+                    ))
+                    if failures:
+                        event["error"] = "部分云区读取失败，已显示可用节点；可点击刷新云区重试。"
+            except Exception:
+                event["error"] = "云区节点读取失败，请检查 Ops 登录信息和网络后刷新。"
+            self.sig_trace_regions.emit(event)
+        self.run_thread(load)
+
+    @Slot(object)
+    def _on_trace_regions(self, event):
+        request = event["request"]
+        if (request is not self._trace_region_request or self.trace_mode.currentText() != "环境溯源"
+                or request["identity"] != self._trace_target_identity()):
+            return
+        self._trace_region_request = None
+        self.trace_region_refresh.setEnabled(True)
+        if "cache_entries" in event:
+            for key, value in event["cache_entries"].items():
+                self._save_selection_cache("cloud_targets", key, value, save=False)
+            self._persist_selection_cache()
+        regions = event.get("regions", [])
+        self.trace_region.set_values(regions)
+        if request["previous"] in regions:
+            self.trace_region.setCurrentText(request["previous"])
+        else:
+            # Initial loads and refreshes must not silently select the first node.
+            self.trace_region.setCurrentIndex(-1)
+        self.trace_region.setEnabled(bool(regions))
+        if request["previous"] and request["previous"] not in regions and regions:
+            self.trace_status.setText(f"当前任务未提供云区“{request['previous']}”，请重新选择云区节点。")
+        else:
+            self.trace_status.setText(event.get("error") or (
+                "云区已加载，选择具体构建任务及云区后点击查询来源。" if regions else "当前没有可用云区，请刷新云区。"))
 
     def _on_trace_job_filter_changed(self, text):
         if not text.strip():
@@ -4553,8 +4870,11 @@ class DeployTool(QMainWindow):
 
     def _clear_trace_job(self):
         self._trace_job_path = []
+        self._trace_display_path = []
         self.trace_job_browser.tree.clearSelection()
         self.trace_job_browser.tree.setCurrentItem(None)
+        self._invalidate_package_trace_input()
+        self._load_trace_regions()
 
     def _select_trace_job(self, item, _column):
         if not self.jenkins or self._job_cache_loading or self._trace_request:
@@ -4565,7 +4885,14 @@ class DeployTool(QMainWindow):
             return
         self._trace_job_client = self.jenkins
         self._trace_job_path = list(data["path"])
+        display, current = [], item
+        while current is not None:
+            display.append(current.text(0))
+            current = current.parent()
+        self._trace_display_path = list(reversed(display))
         self.trace_job_browser.tree.setCurrentItem(item)
+        self._invalidate_package_trace_input()
+        self._load_trace_regions()
 
     def _sync_trace_job_browser(self):
         if not hasattr(self, "trace_job_browser"):
@@ -4603,17 +4930,19 @@ class DeployTool(QMainWindow):
 
     def _invalidate_package_trace_input(self, *_args):
         request = self._trace_request
-        if request and request["input"] != self.trace_input.toPlainText().strip():
+        if request and request["identity"] != self._trace_input_identity():
             request["cancel"].set()
         if not request:
             self._trace_report = None
             self.trace_results.clear()
             self.trace_details.clear()
+            self._trace_environment_summary = ""
             self.trace_status.setText("等待查询。")
             self.trace_status.setToolTip("")
 
     def _set_package_trace_busy(self, busy):
-        for widget in (self.trace_input, self.trace_search_button, self.trace_job_panel):
+        for widget in (self.trace_input, self.trace_search_button, self.trace_job_panel,
+                       self.trace_mode, self.trace_environment_controls):
             widget.setEnabled(not busy)
         self.trace_cancel_button.setEnabled(busy)
 
@@ -4621,7 +4950,6 @@ class DeployTool(QMainWindow):
         if self._trace_request is not None:
             return
         try:
-            packages = parse_packages(self.trace_input.toPlainText())
             if self.jenkins is None or self._job_cache_loading:
                 self.trace_status.setText("请先在 Jenkins 页完成登录并加载任务，再查询包号。")
                 return
@@ -4629,15 +4957,28 @@ class DeployTool(QMainWindow):
                 self._sync_trace_job_browser()
             selected = list(self._trace_job_path) or None
             request = {"client": self.jenkins}
+            environment = self.trace_mode.currentText() == "环境溯源"
+            if environment:
+                settings = self._trace_environment_settings()
+                if not self._cloud_account_complete(settings):
+                    raise ValueError("请先在云端部署页填写 Ops 登录信息。")
+                if self._trace_region_request or not settings["region"]:
+                    raise ValueError("请先加载并选择云区节点。")
+                request["settings"] = dict(settings)
+                packages = []
+            else:
+                packages = parse_packages(self.trace_input.toPlainText())
         except ValueError as exc:
             self.trace_status.setText(str(exc))
             return
         request["cancel"] = threading.Event()
         request["input"] = self.trace_input.toPlainText().strip()
+        request["identity"] = self._trace_input_identity()
         self._trace_request = request
         self._trace_report = None
         self.trace_results.clear()
         self.trace_details.clear()
+        self._trace_environment_summary = ""
         self.trace_status.setToolTip("")
         self._set_package_trace_busy(True)
         self.trace_status.setText("正在读取历史构建，旧包查询可能需要较长时间；可以随时取消。")
@@ -4647,11 +4988,28 @@ class DeployTool(QMainWindow):
 
         def query():
             try:
+                query_packages = packages
+                if request["cancel"].is_set():
+                    raise TraceCancelled()
+                if environment:
+                    send("progress", "正在读取所选环境的 Ops 当前运行镜像…")
+                    api = self._ensure_cloud_login(request["settings"])
+                    if request["cancel"].is_set():
+                        raise TraceCancelled()
+                    current = api.load_current_packages(request["settings"], cancel_event=request["cancel"])
+                    if request["cancel"].is_set():
+                        raise TraceCancelled()
+                    send("environment", current)
+                    # Runtime registries can differ from the Jenkins build registry.
+                    query_packages = list(dict.fromkeys(image.rsplit("/", 1)[-1] for image in current["packages"]))
                 callbacks = {"progress": lambda value: send("progress", value),
                              "on_match": lambda value: send("match", value)}
                 source = JenkinsHistorySource(request["client"], request["cancel"])
-                report = trace_packages(source, packages, scope="selected" if selected else "auto",
+                report = trace_packages(source, query_packages, scope="selected" if selected else "auto",
                                         selected=selected, **callbacks)
+            except (TraceCancelled, InterruptedError):
+                report = {"matches": [], "warnings": [], "unmatched": [], "cancelled": True,
+                          "complete": False, "jobs": 0, "scanned": 0}
             except (RuntimeError, ValueError) as exc:
                 report = {"error": str(exc)}
             except Exception:
@@ -4673,7 +5031,7 @@ class DeployTool(QMainWindow):
         if request is not self._trace_request:
             return
         kind, data = event["kind"], event["data"]
-        stale = (request["input"] != self.trace_input.toPlainText().strip() or
+        stale = (request["identity"] != self._trace_input_identity() or
                  request["client"] is not self.jenkins)
         if stale:
             request["cancel"].set()
@@ -4683,11 +5041,18 @@ class DeployTool(QMainWindow):
                 self._set_package_trace_busy(False)
                 self.trace_results.clear()
                 self.trace_details.clear()
-                self.trace_status.setText("查询账号或包号已切换，请重新查询。")
+                self._trace_environment_summary = ""
+                self.trace_status.setText("查询条件或账号已切换，请重新查询。")
             return
         if kind == "progress":
             if not request["cancel"].is_set():
                 self.trace_status.setText(data)
+        elif kind == "environment":
+            settings = request["settings"]
+            self._trace_environment_summary = (
+                f"环境：{settings['project']} / {settings['deploy_type']} / {settings['cloud']} / {settings['region']}\n"
+                "Ops 当前运行镜像：\n" + "\n".join(data["packages"]))
+            self._show_package_trace_detail(self.trace_results.currentItem())
         elif kind == "match":
             item = QTreeWidgetItem(trace_result_fields(data))
             item.setData(0, Qt.UserRole, data)
@@ -4716,13 +5081,19 @@ class DeployTool(QMainWindow):
             self.trace_status.setToolTip("\n".join(notes) or "打包时间使用 Jenkins 构建记录时间（UTC+8）。")
 
     def _show_package_trace_detail(self, current, _previous=None):
-        self.trace_details.setPlainText(format_trace_match(current.data(0, Qt.UserRole)) if current else "")
+        sections = [self._trace_environment_summary]
+        if current:
+            sections.append(format_trace_match(current.data(0, Qt.UserRole)))
+        self.trace_details.setPlainText("\n\n".join(section for section in sections if section))
 
     def _copy_package_trace(self):
         rows = [self.trace_results.topLevelItem(index).data(0, Qt.UserRole)
                 for index in range(self.trace_results.topLevelItemCount())]
-        if rows:
-            QApplication.clipboard().setText("\n\n".join(format_trace_match(row) for row in rows))
+        sections = [format_trace_match(row) for row in rows]
+        if self.trace_mode.currentText() == "环境溯源" and self._trace_environment_summary:
+            sections.insert(0, self._trace_environment_summary)
+        if sections:
+            QApplication.clipboard().setText("\n\n".join(sections))
 
     def _open_package_trace(self, *_args):
         item = self.trace_results.currentItem()
@@ -4753,10 +5124,10 @@ class DeployTool(QMainWindow):
         # Package card
         pkg_card = CardWidget("包号")
         left_col.addWidget(pkg_card)
-        self.package_input = QLineEdit(self.store.data.get("last_package", ""))
+        self.package_input = DeploymentPackageInput(self.store.data.get("last_package", ""))
         self.package_input.setPlaceholderText("例如：etmbackend-yisen-5.2.0:5.2.0.1001.10345")
         self.package_input.setStyleSheet(f"""
-            QLineEdit {{
+            QPlainTextEdit {{
                 background: {COLORS['input_bg']};
                 border: 1px solid {COLORS['input_border']};
                 border-radius: 8px;
@@ -4765,7 +5136,7 @@ class DeployTool(QMainWindow):
                 font-size: 13px;
                 color: {COLORS['text_primary']};
             }}
-            QLineEdit:focus {{
+            QPlainTextEdit:focus {{
                 border: 2px solid {COLORS['border_focus']};
                 background: #101D31;
             }}
@@ -4773,7 +5144,24 @@ class DeployTool(QMainWindow):
         self.package_input.returnPressed.connect(
             self.apply_deployment_targets_from_package
         )
+        self.package_input.editingFinished.connect(self._on_deployment_package_editing_finished)
+        self.package_input.setToolTip("修改包号后，离开输入框或按回车即可同步两页的 YAML 目录、文件和应用命令")
         pkg_card.content_layout().addWidget(self.package_input)
+        package_hint = QLabel("每行一个包号；Shift+回车换行，回车校验。多个包共用当前环境及删除开关。")
+        package_hint.setWordWrap(True)
+        package_hint.setStyleSheet(f"color: {COLORS['text_muted']};")
+        pkg_card.content_layout().addWidget(package_hint)
+        self.deploy_package_preview = QTreeWidget()
+        self.deploy_package_preview.setHeaderLabels(["包号（选择后可编辑该包的删除命令）", "YAML 路径"])
+        self.deploy_package_preview.setRootIsDecorated(False)
+        self.deploy_package_preview.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.deploy_package_preview.header().setSectionResizeMode(QHeaderView.Stretch)
+        self.deploy_package_preview.setMinimumHeight(100)
+        self.deploy_package_preview.setMaximumHeight(160)
+        self.deploy_package_preview.currentItemChanged.connect(self._on_deploy_package_selected)
+        self.package_input.textChanged.connect(self.deploy_package_preview.hide)
+        self.deploy_package_preview.hide()
+        pkg_card.content_layout().addWidget(self.deploy_package_preview)
 
         # Environment card
         env_card = CardWidget("环境与部署命令")
@@ -4821,6 +5209,8 @@ class DeployTool(QMainWindow):
 
         self.env_entries = {}
         self._create_environment_fields(env_fields_grid, self.env_entries, columns=2)
+        self.deploy_delete_option = self._create_delete_apply_option()
+        env_fields_grid.addWidget(self.deploy_delete_option, len(ENVIRONMENT_FIELDS) // 2, 2, 1, 2)
 
         # Remote loading status
         remote_row = QHBoxLayout()
@@ -5169,6 +5559,62 @@ class DeployTool(QMainWindow):
         log_card.content_layout().addWidget(self.cloud_log)
 
     # ── Helper: Create environment fields ──────────────────────────
+    def _create_delete_apply_option(self):
+        option = DeleteApplyOption()
+        option.checkbox.setChecked(self.delete_before_apply)
+        option.checkbox.toggled.connect(self._set_delete_before_apply)
+        option.command.textEdited.connect(self._on_delete_command_edited)
+        self._delete_options.append(option)
+        self._refresh_delete_options()
+        return option
+
+    @staticmethod
+    def _delete_command_key(data):
+        return tuple(str(data.get(key) or ("22" if key == "port" else "")).strip()
+                     for key in ("host", "port", "yaml_dir", "yaml_file"))
+
+    def _refresh_delete_options(self):
+        key = self._delete_command_key(self._env_var_values)
+        command = self._delete_command_overrides.get(key)
+        for option in self._delete_options:
+            option.set_target(self._get_env_var("yaml_dir"), self._get_env_var("yaml_file"), command)
+
+    def _on_delete_command_edited(self, text):
+        key = self._delete_command_key(self._env_var_values)
+        self._delete_command_overrides[key] = text
+        self._refresh_delete_options()
+
+    def _freeze_delete_options(self, data):
+        data["delete_before_apply"] = getattr(self, "delete_before_apply", False)
+        if not data["delete_before_apply"]:
+            return
+        key = DeployTool._delete_command_key(data)
+        data["delete_command"] = getattr(self, "_delete_command_overrides", {}).get(
+            key, _yaml_delete_command(data["yaml_file"]))
+        data["delete_command_target"] = [data["yaml_dir"], data["yaml_file"]]
+        _deployment_delete_command(data)
+
+    def _set_delete_before_apply(self, checked, *, persist=True):
+        self.delete_before_apply = bool(checked)
+        for option in self._delete_options:
+            option.checkbox.blockSignals(True)
+            option.checkbox.setChecked(self.delete_before_apply)
+            option.checkbox.blockSignals(False)
+        if persist:
+            self.store.data["delete_before_apply"] = self.delete_before_apply
+            self.store.save()
+
+    def _place_build_delete_option(self, expanded):
+        option = self.build_delete_option
+        self.build_env_actions.removeWidget(option)
+        self.build_env_header_layout.removeWidget(option)
+        if expanded:
+            self.build_env_actions.insertWidget(0, option, 1)
+        else:
+            self.build_env_header_layout.addWidget(option, 0, Qt.AlignRight)
+        option.set_compact(not expanded)
+        option.show()
+
     def _create_environment_fields(self, grid, entries, start_row=0, columns=1):
         searchable = {"image_dir", "image_file", "yaml_dir", "yaml_file", "dashboard"}
 
@@ -5214,6 +5660,8 @@ class DeployTool(QMainWindow):
 
     def _on_env_var_changed(self, key, text):
         self._env_var_values[key] = text
+        if key in ("host", "port", "yaml_dir", "yaml_file"):
+            self._refresh_delete_options()
         if not self.loading_environment:
             self.env_dirty = True
 
@@ -5232,6 +5680,18 @@ class DeployTool(QMainWindow):
                 widget.setCurrentText(value)
             elif isinstance(widget, QLineEdit):
                 widget.setText(value)
+
+    def _apply_ssh_target_fields(self, target, *, mark_dirty=False):
+        """Apply a derived YAML target to the shared fields on both pages."""
+        was_loading = getattr(self, "loading_environment", False)
+        was_dirty = getattr(self, "env_dirty", False)
+        self.loading_environment = True
+        try:
+            for key in ("yaml_dir", "yaml_file", "apply_command"):
+                self._set_env_var(key, target[key])
+        finally:
+            self.loading_environment = was_loading
+            self.env_dirty = was_dirty or mark_dirty
 
     # ── Jenkins Operations ─────────────────────────────────────────
     def _auto_login_jenkins(self):
@@ -5694,6 +6154,7 @@ class DeployTool(QMainWindow):
         self.current_job_path = [] if is_folder else path
         self.current_job_url = "" if is_folder else data.get("url", "")
         self.path_label.setText("  " + " / ".join(self.current_display_path))
+        DeployTool._sync_ssh_target_from_job(self)
         self._sync_cloud_target_from_job()
         self._update_build_cloud_ready()
         self._select_build_summary()
@@ -5938,6 +6399,24 @@ class DeployTool(QMainWindow):
     def _save_parameter_cache(self, key, params):
         self._save_selection_cache("parameters", key, self._parameter_cache_value(params))
 
+    def _sync_ssh_target_from_job(self):
+        path = getattr(self, "current_job_path", [])
+        display = getattr(self, "current_display_path", [])
+        product = extract_job_project_code(display) or extract_job_project_code(path)
+        service = job_service_type(path, display)
+        self._preview_ssh_target = None
+        if not path or not product or not service:
+            if hasattr(self, "build_yaml_preview_label"):
+                self.build_yaml_preview_label.setText("选择可识别的具体任务后自动匹配 YAML；部署前按最终包号校验。")
+            return
+        filename = product.lower() + ("mobile" if service == "mobile" else "") + ".yaml"
+        target = {"yaml_dir": f"/data/yaml/app/{service}", "yaml_file": filename,
+                  "apply_command": f"kubectl apply -f {filename}"}
+        self._preview_ssh_target = target
+        DeployTool._apply_ssh_target_fields(self, target)
+        self.build_yaml_preview_label.setText(
+            f"已按当前任务自动匹配：{target['yaml_dir']}/{filename}（本次部署预览）")
+
     def _sync_cloud_target_from_job(self):
         project = extract_job_project_code(self._selected_module_path)
         if not project:
@@ -6007,18 +6486,25 @@ class DeployTool(QMainWindow):
             return
 
         self.params_layout.setColumnStretch(1, 1)
+        branch_params = {param.get("name"): param for param in params
+                         if param.get("name") in ("GIT_BRANCH", "GIT_BRANCH2")}
+        shared_branches = len(branch_params) == 2
 
         for row, param in enumerate(params):
             name = param.get("name", "")
+            input_span = 1 if shared_branches and name in branch_params else 2
             default = saved.get(name, param.get("defaultParameterValue", {}).get("value", ""))
             if param.get("type") == "BooleanParameterDefinition":
                 default = str(default).lower()
             choices = param.get("choices") or []
-            if name != "GIT_BRANCH2" and choices and default not in choices:
+            if shared_branches and name == "GIT_BRANCH2":
+                choices = branch_params["GIT_BRANCH"].get("choices") or []
+            if name not in ("GIT_BRANCH2", "CUSTOM_NAME") and choices and default not in choices:
                 remote_name = f"origin/{default}"
                 default = remote_name if remote_name in choices else choices[0]
 
             refreshable_branch = self._is_refreshable_branch_parameter(name, param)
+            refreshable_choice = name == "CUSTOM_NAME"
 
             # Name label
             name_label = QLabel(name)
@@ -6029,7 +6515,7 @@ class DeployTool(QMainWindow):
             self.params_layout.addWidget(name_label, row, 0, Qt.AlignLeft | Qt.AlignVCenter)
 
             # Input widget
-            if choices or refreshable_branch:
+            if choices or refreshable_branch or refreshable_choice:
                 widget = SearchableComboBox()
                 widget.set_values(choices)
                 widget.setCurrentText("" if default is None else str(default))
@@ -6043,7 +6529,7 @@ class DeployTool(QMainWindow):
                 widget.setText("" if default is None else str(default))
                 self.param_vars[name] = ("text", widget)
 
-            if refreshable_branch:
+            if refreshable_choice or (refreshable_branch and not (shared_branches and name == "GIT_BRANCH2")):
                 # Keep the refresh control next to the branch selector so a
                 # user can update only this remote list without resetting the
                 # other Jenkins parameters already entered in the form.
@@ -6053,7 +6539,7 @@ class DeployTool(QMainWindow):
                 input_layout.setSpacing(6)
                 input_layout.addWidget(widget, 1)
 
-                refresh_button = QPushButton("刷新分支")
+                refresh_button = QPushButton("刷新选项" if refreshable_choice else "刷新分支")
                 refresh_button.setObjectName("GhostBtn")
                 # The global button padding/minimum used to override the
                 # fixed 34px height and push this button below the combo.
@@ -6065,8 +6551,15 @@ class DeployTool(QMainWindow):
                 widget.setFixedHeight(row_height)
                 refresh_button.setFixedHeight(row_height)
                 refresh_button.setAutoDefault(False)
-                refresh_button.setAccessibleName(f"刷新 {name} 分支列表")
-                refresh_button.setToolTip("重新从 Jenkins 获取最新的打包分支")
+                shared_refresh = shared_branches and name == "GIT_BRANCH"
+                refresh_button.setAccessibleName(
+                    "刷新 GIT_BRANCH 和 GIT_BRANCH2 分支列表" if shared_refresh else f"刷新 {name} 分支列表")
+                refresh_button.setToolTip(
+                    "同时刷新 GIT_BRANCH 和 GIT_BRANCH2 的候选分支，保留各自填写值"
+                    if shared_refresh else "重新从 Jenkins 获取最新的打包分支")
+                if refreshable_choice:
+                    refresh_button.setAccessibleName(f"刷新 {name} 选项")
+                    refresh_button.setToolTip("从 Jenkins 获取当前任务的最新选项，保留当前填写值")
                 refresh_button.clicked.connect(
                     lambda _checked=False, parameter=name: self.refresh_branch_choices(
                         parameter
@@ -6074,46 +6567,91 @@ class DeployTool(QMainWindow):
                 )
                 input_layout.addWidget(refresh_button)
                 self.param_refresh_buttons[name] = refresh_button
-                self.params_layout.addWidget(input_row, row, 1)
+                self.params_layout.addWidget(input_row, row, 1, 1, input_span)
+            elif shared_branches and name == "GIT_BRANCH2":
+                input_row = QWidget()
+                input_layout = QHBoxLayout(input_row)
+                input_layout.setContentsMargins(0, 0, 0, 0)
+                input_layout.setSpacing(6)
+                widget.ensurePolished()
+                widget.setFixedHeight(widget.sizeHint().height())
+                input_layout.addWidget(widget, 1)
+                self.params_layout.addWidget(input_row, row, 1, 1, input_span)
             else:
-                self.params_layout.addWidget(widget, row, 1)
+                self.params_layout.addWidget(widget, row, 1, 1, input_span)
 
             # Description
             description = param.get("description")
             if name == "GIT_BRANCH2" and is_secondary_build_path(path):
                 description = "二开打包优先使用此分支，未填写时使用 GIT_BRANCH"
             if description:
+                name_label.setToolTip(description)
+                widget.setToolTip(description)
                 desc_label = QLabel(description)
                 desc_label.setStyleSheet(f"""
                     font-family: "{FONT_FAMILY}"; font-size: 11px;
                     color: {COLORS['text_muted']}; background: transparent;
                 """)
                 desc_label.setWordWrap(True)
-                self.params_layout.addWidget(desc_label, row, 2, Qt.AlignLeft | Qt.AlignVCenter)
+                self.params_layout.addWidget(desc_label, row, 3, Qt.AlignLeft | Qt.AlignVCenter)
 
-            if name.upper() == "GIT_BRANCH":
-                self._branch_summary_rows.append((row, [
+            if name in ("CUSTOM_NAME", "GIT_BRANCH2", "GIT_BRANCH"):
+                self._branch_summary_rows.append((name, row, [
                     (column, self.params_layout.itemAtPosition(row, column).widget())
-                    for column in range(3)
+                    for column in (0, 1, 3)
                     if self.params_layout.itemAtPosition(row, column) is not None
                 ]))
 
+        if shared_branches:
+            self.param_refresh_buttons["GIT_BRANCH2"] = self.param_refresh_buttons["GIT_BRANCH"]
         self._set_parameters_expanded(self.params_card._toggle.isChecked())
 
     def _set_parameters_expanded(self, expanded):
         # Move the same controls between layouts so edits and branch refresh
         # always operate on the values used by start_build.
-        source = self.branch_summary_layout if expanded else self.params_layout
-        target = self.params_layout if expanded else self.branch_summary_layout
-        for compact_row, (original_row, cells) in enumerate(self._branch_summary_rows):
+        is_ssh = self.build_deploy_mode.currentText() == "SSH 环境部署"
+        branch = "GIT_BRANCH2" if is_ssh and "GIT_BRANCH2" in self.param_vars else "GIT_BRANCH"
+        compact_names = ("CUSTOM_NAME", branch) if is_ssh else ("GIT_BRANCH",)
+        buttons = getattr(self, "param_refresh_buttons", {})
+        shared_branches = "GIT_BRANCH" in buttons and buttons.get("GIT_BRANCH2") is buttons["GIT_BRANCH"]
+        visible_rows = False
+        for name, original_row, cells in self._branch_summary_rows:
+            compact = not expanded and name in compact_names
+            visible_rows = visible_rows or compact
             for column, widget in cells:
-                source.removeWidget(widget)
+                # Long Jenkins descriptions stay in the expanded form; the
+                # compact SSH fields retain them as tooltips.
+                outside = compact and not (is_ssh and name in ("CUSTOM_NAME", "GIT_BRANCH2") and column == 3)
+                target = self.branch_summary_layout if outside else self.params_layout
+                self.params_layout.removeWidget(widget)
+                self.branch_summary_layout.removeWidget(widget)
+                input_span = 2 if (not outside and column == 1 and
+                                   not (shared_branches and name in ("GIT_BRANCH", "GIT_BRANCH2"))) else 1
                 target.addWidget(
-                    widget, original_row if expanded else compact_row, column,
+                    widget, compact_names.index(name) if outside else original_row,
+                    2 if outside and column == 3 else column, 1, input_span,
                     Qt.AlignVCenter,
                 )
                 widget.show()
-        self.branch_summary.setVisible(bool(self._branch_summary_rows) and not expanded)
+        if shared_branches:
+            button = buttons["GIT_BRANCH"]
+            button.parentWidget().layout().removeWidget(button)
+            input_row = self.param_vars[branch][1].parentWidget()
+            rows = sorted(row for name, row, _cells in self._branch_summary_rows
+                          if name in ("GIT_BRANCH", "GIT_BRANCH2"))
+            # Only span adjacent fields; never cover unrelated Jenkins rows.
+            span_rows = expanded and len(rows) == 2 and rows[1] == rows[0] + 1
+            button.setSizePolicy(button.sizePolicy().horizontalPolicy(),
+                                 QSizePolicy.Expanding if span_rows else QSizePolicy.Fixed)
+            if span_rows:
+                button.setMinimumHeight(0)
+                button.setMaximumHeight(16777215)
+                self.params_layout.addWidget(button, rows[0], 2, 2, 1)
+            else:
+                button.setFixedHeight(self.param_vars[branch][1].height())
+                input_row.layout().addWidget(button)
+            button.show()
+        self.branch_summary.setVisible(visible_rows)
 
     @staticmethod
     def _is_refreshable_branch_parameter(name, param):
@@ -6145,8 +6683,10 @@ class DeployTool(QMainWindow):
         return choices[0] if choices else current
 
     def refresh_branch_choices(self, name):
-        """Refresh one Git branch parameter asynchronously from Jenkins."""
+        """Refresh one choice source and any selectors sharing it."""
         name = str(name or "").strip()
+        if name == "GIT_BRANCH2" and "GIT_BRANCH" in getattr(self, "param_vars", {}):
+            name = "GIT_BRANCH"
         client = getattr(self, "jenkins", None)
         path = list(getattr(self, "current_job_path", []) or [])
         info = getattr(self, "param_vars", {}).get(name)
@@ -6179,7 +6719,8 @@ class DeployTool(QMainWindow):
         if button is not None:
             button.setEnabled(False)
             button.setText("刷新中…")
-        self.emit("loading_start", f"正在刷新 {name} 分支...")
+        label = "选项" if name == "CUSTOM_NAME" else "分支"
+        self.emit("loading_start", f"正在刷新 {name} {label}...")
 
         job_url = str(getattr(self, "current_job_url", "") or "").strip()
         if not job_url:
@@ -6204,7 +6745,10 @@ class DeployTool(QMainWindow):
         # GIT_BRANCH2 is a free-text override backed by GIT_BRANCH's repository list.
         source_name = "GIT_BRANCH" if name == "GIT_BRANCH2" else name
         try:
-            fetch_choices = getattr(client, "get_git_parameter_choices", None)
+            fetch_choices = (
+                (lambda url, parameter: client._get_parameter_choices(path, parameter, job_url=url))
+                if name == "CUSTOM_NAME" else getattr(client, "get_git_parameter_choices", None)
+            )
             if fetch_choices is None:
                 # Compatibility with injected/test clients that still expose
                 # only the original private Jenkins helper.
@@ -6296,25 +6840,28 @@ class DeployTool(QMainWindow):
         info = getattr(self, "param_vars", {}).get(name)
         if not info or info[0] != "combo":
             return
-        widget = info[1]
-        current = widget.currentText()
-        widget.set_values(choices)
-        selected = (
-            current if name == "GIT_BRANCH2"
-            else self._preferred_branch_choice(current, choices)
-        )
-        if selected or name == "GIT_BRANCH2":
+        shared_branches = name in ("GIT_BRANCH", "GIT_BRANCH2") and all(
+            parameter in self.param_vars for parameter in ("GIT_BRANCH", "GIT_BRANCH2"))
+        targets = ("GIT_BRANCH", "GIT_BRANCH2") if shared_branches else (name,)
+        for parameter in targets:
+            widget = self.param_vars[parameter][1]
+            current = widget.currentText()
+            widget.set_values(choices)
+            # Refresh changes shared options, never either independent override.
+            selected = (current if shared_branches or parameter in ("GIT_BRANCH2", "CUSTOM_NAME")
+                        else self._preferred_branch_choice(current, choices))
             widget.setCurrentText(selected)
         key = getattr(self, "_displayed_parameter_key", None)
         params = self._cached_parameters(key) if key else None
         if params is not None:
             for param in params:
-                if param.get("name") == name:
+                if param.get("name") in targets:
                     param["choices"] = list(choices)
             self._save_parameter_cache(key, params)
         button = getattr(self, "param_refresh_buttons", {}).get(name)
         if button is not None:
-            button.setToolTip(f"已获取 {len(choices)} 个最新分支；点击可再次刷新")
+            label = "选项" if name == "CUSTOM_NAME" else "分支"
+            button.setToolTip(f"已获取 {len(choices)} 个最新{label}；点击可再次刷新")
 
     @Slot(object)
     def _on_branch_refresh_error(self, payload):
@@ -6328,7 +6875,7 @@ class DeployTool(QMainWindow):
         overlay = getattr(self, "message_overlay", None)
         if overlay is not None:
             overlay.show_message(
-                "分支刷新失败",
+                "选项刷新失败" if name == "CUSTOM_NAME" else "分支刷新失败",
                 f"{name}：{message}",
                 kind="error",
             )
@@ -6351,7 +6898,7 @@ class DeployTool(QMainWindow):
             button = getattr(self, "param_refresh_buttons", {}).get(name)
             if button is not None:
                 button.setEnabled(bool(getattr(self, "jenkins", None)))
-                button.setText("刷新分支")
+                button.setText("刷新选项" if name == "CUSTOM_NAME" else "刷新分支")
         # Every request emits one loading_start, including requests that
         # became stale after the user selected another Jenkins job.
         self.emit("loading_stop", None)
@@ -6477,6 +7024,10 @@ class DeployTool(QMainWindow):
         self, mode, prompt_for_account, refresh_cloud=True
     ):
         is_cloud = mode == "云端部署"
+        if hasattr(self, "params_card"):
+            entered_ssh = not is_cloud and getattr(self, "_parameters_deploy_mode", None) != mode
+            self._parameters_deploy_mode = mode
+            self.params_card.set_expanded(False if entered_ssh else self.params_card._toggle.isChecked())
         deploy_after_build = DeployTool._deploy_after_build_enabled(self)
         self.build_deploy_mode.setEnabled(deploy_after_build and not self.build_running)
         self.build_env_label.setVisible(not is_cloud)
@@ -6710,12 +7261,14 @@ class DeployTool(QMainWindow):
             owner.emit("open_dashboard_item", dashboard)
         return len(opened)
 
+    @trace_operation("target_queue_wait")
     def _wait_for_deployment_target(self, key, cancel_event=None, log_target="build_log"):
         window_manager = getattr(self, "window_manager", None)
         if not window_manager:
             return
 
         def announce_wait():
+            trace_event(self, "waiting", wait_reason="same_deployment_target")
             self.emit(log_target, "相同部署目标正在被另一个任务使用，已进入安全队列...")
             if log_target == "build_log":
                 self.emit("build_status", "等待相同目标的部署任务完成...")
@@ -6807,6 +7360,15 @@ class DeployTool(QMainWindow):
                     self, "未选择环境",
                     '请先在"环境部署与 Dashboard"页新增并选择目标环境',
                 )
+                return
+            preview = getattr(self, "_preview_ssh_target", None)
+            if preview:
+                environment.update(preview)
+                environment["_preview_yaml"] = dict(preview)
+            try:
+                DeployTool._freeze_delete_options(self, environment)
+            except ValueError as exc:
+                QMessageBox.warning(self, "删除命令无效", str(exc))
                 return
             dashboard = self._dashboard_for_environment(environment)
             if not dashboard:
@@ -6925,17 +7487,22 @@ class DeployTool(QMainWindow):
     ):
         client = getattr(self, "_active_build_client", None) or self.jenkins
         try:
+            trace_event(self, "pipeline_started", job=" / ".join(path), mode=deployment_mode)
             self.emit("build_log", f"提交构建：{' / '.join(path)}")
-            queue_url = client.build(path, params, job_url)
+            with trace_stage(self, "jenkins_submit"):
+                queue_url = client.build(path, params, job_url)
             self.emit("build_status", "已提交，等待 Jenkins 执行器...")
-            result, console = client.wait_for_build(
-                queue_url,
-                lambda line: self._handle_build_output(line),
-                lambda percent, status: self._handle_build_progress(percent, status),
-                self.cancel_event,
-                lambda phase, url: self.emit("pipeline_location", (phase, url)),
-            )
+            with trace_stage(self, "jenkins_wait"):
+                result, console = client.wait_for_build(
+                    queue_url,
+                    lambda line: self._handle_build_output(line),
+                    lambda percent, status: self._handle_build_progress(percent, status),
+                    self.cancel_event,
+                    lambda phase, url: self.emit("pipeline_location", (phase, url)),
+                )
             status = result.get("result")
+            trace_event(self, "jenkins_result", result=status,
+                        build_number=result.get("number"), jenkins_duration_ms=result.get("duration"))
             self.emit("build_log", f"构建结束：#{result.get('number')} {status}")
             if self.cancel_event.is_set() or status == "ABORTED":
                 raise PipelineCancelled("Jenkins 构建已终止")
@@ -6984,6 +7551,12 @@ class DeployTool(QMainWindow):
                 # Jenkins controls the final package number. Re-resolve the
                 # deployment target here so a stale saved profile (for example
                 # etm.yaml) cannot be used for an ESC/PQM build.
+                preview = environment.get("_preview_yaml")
+                inferred = infer_ssh_deployment_config(package)
+                if preview and any(inferred[key] != preview[key] for key in preview):
+                    raise RuntimeError(
+                        f"最终包号对应的 YAML 与任务预览不一致：预览 {preview['yaml_dir']}/{preview['yaml_file']}，"
+                        f"实际 {inferred['yaml_dir']}/{inferred['yaml_file']}。已停止部署，请核对 Jenkins 任务。")
                 environment = resolve_ssh_environment_for_package(
                     environment, package
                 )
@@ -6997,21 +7570,22 @@ class DeployTool(QMainWindow):
                 self.emit("select_deploy_tab", None)
                 if batch_token:
                     self.emit("build_status", "打包完成，等待合并部署...")
-                    leader, entries = self.window_manager.batch_coordinator.wait_until_ready(
-                        self,
-                        batch_token,
-                        {
-                            "owner": self,
-                            "environment": environment,
-                            "package": package,
-                            "dashboard": dashboard,
-                        },
-                        self.cancel_event,
-                        lambda count, ready: self.emit(
-                            "deploy_progress",
-                            (0, f"已进入合并批次（{count} 个任务），打包完成后自动部署..."),
-                        ),
-                    )
+                    with trace_stage(self, "batch_wait", wait_reason="batch_ready_or_leader_completion"):
+                        leader, entries = self.window_manager.batch_coordinator.wait_until_ready(
+                            self,
+                            batch_token,
+                            {
+                                "owner": self,
+                                "environment": environment,
+                                "package": package,
+                                "dashboard": dashboard,
+                            },
+                            self.cancel_event,
+                            lambda count, ready: self.emit(
+                                "deploy_progress",
+                                (0, f"已进入合并批次（{count} 个任务），打包完成后自动部署..."),
+                            ),
+                        )
                     if leader:
                         error = None
                         try:
@@ -7033,20 +7607,21 @@ class DeployTool(QMainWindow):
                                         "deploy_progress",
                                         (0, "当前拉取已安全停止，等待新任务打包完成..."),
                                     )
-                                    active_entries = (
-                                        self.window_manager.batch_coordinator.collect_pending_entries(
-                                            batch_token,
-                                            active_entries,
-                                            self.cancel_event,
-                                            lambda count: self.emit(
-                                                "deploy_progress",
-                                                (
-                                                    0,
-                                                    f"等待 {count} 个新任务完成打包后重新合批...",
+                                    with trace_stage(self, "batch_rejoin_wait"):
+                                        active_entries = (
+                                            self.window_manager.batch_coordinator.collect_pending_entries(
+                                                batch_token,
+                                                active_entries,
+                                                self.cancel_event,
+                                                lambda count: self.emit(
+                                                    "deploy_progress",
+                                                    (
+                                                        0,
+                                                        f"等待 {count} 个新任务完成打包后重新合批...",
+                                                    ),
                                                 ),
-                                            ),
+                                            )
                                         )
-                                    )
                                     self.emit(
                                         "deploy_log",
                                         f"安全中断完成，重新合批后共有 {len(active_entries)} 个任务。",
@@ -7092,6 +7667,7 @@ class DeployTool(QMainWindow):
                 self.emit("build_status", "一键流程执行完成")
                 self.emit("info", f"打包、部署已完成：\n{package}")
         except PipelineCancelled as exc:
+            trace_event(self, "pipeline_result", result="cancelled", exception_type=type(exc).__name__)
             self.emit(
                 "build_status",
                 "一键流程已取消" if deploy_after_build else "打包已取消",
@@ -7099,6 +7675,7 @@ class DeployTool(QMainWindow):
             self.emit("build_log", str(exc))
             self.emit("info", str(exc))
         except Exception as exc:
+            trace_event(self, "pipeline_result", result="failed", exception_type=type(exc).__name__)
             self.emit(
                 "build_status",
                 "一键流程执行失败" if deploy_after_build else "打包执行失败",
@@ -7267,6 +7844,13 @@ class DeployTool(QMainWindow):
             self.build_env_combo.setCurrentText(name)
         self.loading_environment = False
         self.env_dirty = False
+        if (hasattr(self, "deploy_package_preview")
+                and self.deploy_package_preview.topLevelItemCount() > 1
+                and not self.deploy_package_preview.isHidden()
+                and self.tab_widget.currentWidget().objectName() == "DeployPage"):
+            DeployTool._preview_ssh_fields_from_package(self, report_error=False)
+        elif hasattr(self, "build_yaml_preview_label"):
+            DeployTool._sync_ssh_target_from_job(self)
 
     def save_environment(self):
         name = self.build_env_combo.currentText()
@@ -7456,7 +8040,7 @@ class DeployTool(QMainWindow):
             )
             return
         try:
-            split_package_number(self.package_input.text())
+            packages = parse_deployment_packages(self.package_input.text())
         except ValueError as exc:
             QMessageBox.warning(self, "包号无效", str(exc))
             return
@@ -7464,24 +8048,58 @@ class DeployTool(QMainWindow):
         if not data["host"] or not data["username"]:
             QMessageBox.warning(self, "缺少信息", "请先新增并选择一个环境")
             return
+        entries = []
+        try:
+            for package in packages:
+                environment = resolve_ssh_environment_for_package(data, package)
+                DeployTool._freeze_delete_options(self, environment)
+                entries.append({"owner": self, "package": package, "environment": environment,
+                                "result": "未执行"})
+        except ValueError as exc:
+            QMessageBox.warning(self, "部署配置无效", str(exc))
+            return
         self.deploy_log.clear()
-        package = self.package_input.text().strip().strip("[]")
-        self.store.data["last_package"] = package
+        # Keep the legacy single-package default usable by the cloud page.
+        self.store.data["last_package"] = packages[0]
         self.store.save()
+        if hasattr(self, "cancel_event"):
+            self.cancel_event.clear()
+        multiple = len(entries) > 1
+        package_label = "\n".join(packages)
         target = self.env_combo.currentText().strip() or data.get("host", "")
         if hasattr(self, "_begin_tracked_task"):
             self._begin_tracked_task(
-                "SSH 部署",
+                "SSH 批量部署" if multiple else "SSH 部署",
                 target,
-                package=package,
-                title=package.split(":", 1)[0],
+                package=package_label,
+                title=f"批量部署 {len(entries)} 个包" if multiple else packages[0].split(":", 1)[0],
             )
         self.emit("deploy_progress", (0, "准备连接目标环境..."))
         self.run_thread(
-            lambda: self._run_deploy_with_target_lock(data, package),
+            (lambda: self._run_manual_deployment_batch(entries)) if multiple else
+            (lambda: self._run_deploy_with_target_lock(entries[0]["environment"], packages[0])),
             on_finished=getattr(self, "_finish_standalone_task", None),
         )
 
+    def _run_manual_deployment_batch(self, entries):
+        try:
+            self._execute_deploy_batch(entries, unified_apply=True)
+            self.emit("deploy_progress", (100, f"批量部署完成：{len(entries)} 个包"))
+            self.emit("info", f"{len(entries)} 个包已完成环境部署")
+        except PipelineCancelled as exc:
+            self.emit("deploy_progress", (0, "批量部署已取消"))
+            self.emit("deploy_log", exception_message(exc))
+        except Exception as exc:
+            self.emit("deploy_progress", (0, "批量部署未全部完成，请查看各包结果"))
+            self.emit("error", f"批量部署失败：{exception_message(exc)}")
+        finally:
+            self.emit("deploy_log", "批量部署结果：")
+            for entry in entries:
+                result = entry.get("result", "未执行")
+                self.emit("deploy_log", f'{entry["package"]}：{result}')
+                trace_event(self, "batch_package_result", package=entry["package"], result=result)
+
+    @trace_operation("remote_command")
     def _remote_exec(
         self,
         client,
@@ -7510,6 +8128,7 @@ class DeployTool(QMainWindow):
         last_activity_at = command_started_at
         last_heartbeat_at = command_started_at
         image_progress = DockerImageProgress(transfer_images, progress_range) if transfer_images and progress_range else None
+        transfer_trace = RemoteTransferTrace(self) if progress_range else None
 
         def report_progress(percent, status):
             if on_progress:
@@ -7541,6 +8160,11 @@ class DeployTool(QMainWindow):
                     continue
                 if image_progress:
                     report_image_progress(image_progress.feed(line))
+                if transfer_trace:
+                    transfer_trace.feed(
+                        line, image=image_progress.current_image if image_progress else "",
+                        phase=image_progress.phase if image_progress else transfer_phase,
+                    )
                 lower_line = line.casefold()
                 next_phase = ""
                 if "the push refers to repository" in lower_line:
@@ -7591,64 +8215,72 @@ class DeployTool(QMainWindow):
                     self.emit("deploy_log", line)
                     last_log_line = line
 
-        while not stdout.channel.exit_status_ready():
-            if stdout.channel.recv_ready():
-                consume(decoder.decode(stdout.channel.recv(65536)))
-            if stdout.channel.recv_stderr_ready():
-                consume(decoder.decode(stdout.channel.recv_stderr(65536)))
-            if interrupt_event and interrupt_event.is_set():
-                if interrupt_allowed and not interrupt_allowed():
-                    interrupt_event.clear()
-                    if on_interrupt_failed:
-                        on_interrupt_failed()
-                    self.emit(
-                        "deploy_log",
-                        "确认中断时阶段已转为推送，已按安全策略继续当前搬运。",
-                    )
-                else:
-                    try:
-                        if not process_group_file:
-                            raise RuntimeError("远端命令没有可确认的进程组文件")
-                        self._terminate_remote_process_group(
-                            client, process_group_file
-                        )
-                    except Exception as exc:
+        code = None
+        try:
+            while not stdout.channel.exit_status_ready():
+                if transfer_trace:
+                    transfer_trace.tick()
+                if stdout.channel.recv_ready():
+                    consume(decoder.decode(stdout.channel.recv(65536)))
+                if stdout.channel.recv_stderr_ready():
+                    consume(decoder.decode(stdout.channel.recv_stderr(65536)))
+                if interrupt_event and interrupt_event.is_set():
+                    if interrupt_allowed and not interrupt_allowed():
                         interrupt_event.clear()
                         if on_interrupt_failed:
                             on_interrupt_failed()
                         self.emit(
                             "deploy_log",
-                            f"安全中断失败，当前镜像搬运将继续执行：{exception_message(exc)}",
+                            "确认中断时阶段已转为推送，已按安全策略继续当前搬运。",
                         )
                     else:
-                        stdout.channel.close()
-                        raise RemoteCommandInterrupted(
-                            "镜像拉取已安全停止，准备重新合批"
+                        try:
+                            if not process_group_file:
+                                raise RuntimeError("远端命令没有可确认的进程组文件")
+                            self._terminate_remote_process_group(
+                                client, process_group_file
+                            )
+                        except Exception as exc:
+                            interrupt_event.clear()
+                            if on_interrupt_failed:
+                                on_interrupt_failed()
+                            self.emit(
+                                "deploy_log",
+                                f"安全中断失败，当前镜像搬运将继续执行：{exception_message(exc)}",
+                            )
+                        else:
+                            stdout.channel.close()
+                            raise RemoteCommandInterrupted(
+                                "镜像拉取已安全停止，准备重新合批"
+                            )
+                now = time.monotonic()
+                if (
+                    progress_range
+                    and now - last_activity_at >= 10
+                    and now - last_heartbeat_at >= 10
+                ):
+                    last_heartbeat_at = now
+                    elapsed = int(now - command_started_at)
+                    phase_text = "推送" if transfer_phase == "push" else "拉取与校验"
+                    heartbeat_progress = max(progress_range[0], last_progress)
+                    if image_progress:
+                        report_image_progress(image_progress.heartbeat(elapsed))
+                    else:
+                        report_progress(
+                            heartbeat_progress,
+                            f"镜像仍在{phase_text}，远端命令已运行 {elapsed} 秒...",
                         )
-            now = time.monotonic()
-            if (
-                progress_range
-                and now - last_activity_at >= 10
-                and now - last_heartbeat_at >= 10
-            ):
-                last_heartbeat_at = now
-                elapsed = int(now - command_started_at)
-                phase_text = "推送" if transfer_phase == "push" else "拉取与校验"
-                heartbeat_progress = max(progress_range[0], last_progress)
-                if image_progress:
-                    report_image_progress(image_progress.heartbeat(elapsed))
-                else:
-                    report_progress(
-                        heartbeat_progress,
-                        f"镜像仍在{phase_text}，远端命令已运行 {elapsed} 秒...",
-                    )
-            time.sleep(0.02)
-        while stdout.channel.recv_ready():
-            consume(decoder.decode(stdout.channel.recv(65536)))
-        while stdout.channel.recv_stderr_ready():
-            consume(decoder.decode(stdout.channel.recv_stderr(65536)))
-        consume(decoder.decode(b"", final=True), final=True)
-        code = stdout.channel.recv_exit_status()
+                time.sleep(0.02)
+            while stdout.channel.recv_ready():
+                consume(decoder.decode(stdout.channel.recv(65536)))
+            while stdout.channel.recv_stderr_ready():
+                consume(decoder.decode(stdout.channel.recv_stderr(65536)))
+            consume(decoder.decode(b"", final=True), final=True)
+            code = stdout.channel.recv_exit_status()
+        finally:
+            if transfer_trace:
+                transfer_trace.finish(code)
+        trace_event(self, "remote_exit", exit_code=code)
         if code:
             raise RuntimeError(f"命令退出码 {code}：{command}")
         if progress_range and not image_progress:
@@ -7734,16 +8366,21 @@ class DeployTool(QMainWindow):
             reason = "未识别的探测错误，原始输出已省略以保护认证信息"
         return False, f"镜像探测失败，是否存在尚无法确认（退出码 {code}）：{reason}"
 
+    @trace_operation("image_visibility_wait")
     def _wait_for_remote_image(
         self, client, image_ref, timeout_seconds=600, cancel_event=None
     ):
         """Wait for the pushed image to become visible in the target registry."""
         deadline = time.monotonic() + max(1, int(timeout_seconds))
         last_diagnostic = "尚未取得探测结果"
+        attempt = 0
         while time.monotonic() < deadline:
             if cancel_event and cancel_event.is_set():
                 raise PipelineCancelled("等待目标镜像期间已取消")
-            visible, last_diagnostic = self._probe_remote_image(client, image_ref)
+            attempt += 1
+            with trace_stage(self, "image_probe", image=image_ref, attempt=attempt):
+                visible, last_diagnostic = self._probe_remote_image(client, image_ref)
+            trace_event(self, "image_probe_result", image=image_ref, attempt=attempt, visible=visible)
             if visible:
                 return
             remaining = max(1, int(deadline - time.monotonic()))
@@ -7754,6 +8391,7 @@ class DeployTool(QMainWindow):
             time.sleep(3)
         raise RuntimeError(f"目标镜像确认超时：{image_ref}；最后一次探测：{last_diagnostic}")
 
+    @trace_operation("sftp_update")
     def _sftp_update(self, sftp, remote_path, transform, allow_unchanged=False):
         temp_dir = CONFIG_DIR / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -7844,20 +8482,26 @@ class DeployTool(QMainWindow):
         finally:
             self._release_deployment_target(target_key)
 
+    @trace_operation("ssh_deploy")
     def _execute_deploy(self, data, package, cancel_event=None):
         data = resolve_ssh_environment_for_package(data, package)
+        if data.get("delete_before_apply") is True:
+            _deployment_delete_command(data)
         started_at = time.monotonic()
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             self.emit("deploy_progress", (2, "正在连接 SSH..."))
             self.emit("deploy_log", f"连接 {data['host']}:{data.get('port', '22')} ...")
-            connect_ssh_client(client, data)
+            with trace_stage(self, "ssh_connect", host=data["host"], port=data.get("port", "22")):
+                connect_ssh_client(client, data)
             self.emit("deploy_progress", (8, "SSH 已连接，正在更新镜像清单..."))
-            sftp = client.open_sftp()
+            with trace_stage(self, "sftp_connect"):
+                sftp = client.open_sftp()
             yaml_path = posixpath.join(data["yaml_dir"], data["yaml_file"])
-            with sftp.open(yaml_path, "r") as remote_yaml:
-                yaml_content = remote_yaml.read().decode("utf-8", "replace")
+            with trace_stage(self, "yaml_read", yaml_path=yaml_path):
+                with sftp.open(yaml_path, "r") as remote_yaml:
+                    yaml_content = remote_yaml.read().decode("utf-8", "replace")
             # Validate before the expensive Docker transfer. This turns a bad
             # package/YAML mapping into an immediate error instead of a failure
             # after twenty minutes of pulling and pushing layers.
@@ -7871,9 +8515,11 @@ class DeployTool(QMainWindow):
                 "docker manifest inspect --insecure "
                 f"{shell_quote(target_image)} >/dev/null 2>&1"
             )
-            image_already_present = self._remote_command_succeeded(
-                client, manifest_command
-            )
+            with trace_stage(self, "image_exists_probe", image=target_image):
+                image_already_present = self._remote_command_succeeded(
+                    client, manifest_command
+                )
+            trace_event(self, "image_exists_result", image=target_image, visible=image_already_present)
             if image_already_present:
                 self.emit(
                     "deploy_log",
@@ -7883,9 +8529,10 @@ class DeployTool(QMainWindow):
             else:
                 workspace = ""
                 try:
-                    workspace = self._create_isolated_image_workspace(
-                        sftp, data, package
-                    )
+                    with trace_stage(self, "workspace_prepare"):
+                        workspace = self._create_isolated_image_workspace(
+                            sftp, data, package
+                        )
                     self.emit(
                         "deploy_log",
                         f"已创建任务独立镜像清单：{workspace}/{posixpath.basename(data['image_file'])}",
@@ -7894,12 +8541,13 @@ class DeployTool(QMainWindow):
                         raise PipelineCancelled("镜像配置完成，后续步骤已取消")
                     transfer_started_at = time.monotonic()
                     self.emit("deploy_progress", (15, "正在搬运镜像..."))
-                    self._remote_exec(
-                        client,
-                        f"cd {shell_quote(workspace)} && {data['pull_command']}",
-                        progress_range=(15, 78),
-                        transfer_images=[target_image],
-                    )
+                    with trace_stage(self, "image_transfer"):
+                        self._remote_exec(
+                            client,
+                            f"cd {shell_quote(workspace)} && {data['pull_command']}",
+                            progress_range=(15, 78),
+                            transfer_images=[target_image],
+                        )
                     self.emit(
                         "deploy_log",
                         "镜像拉取及推送完成，耗时 "
@@ -7910,41 +8558,140 @@ class DeployTool(QMainWindow):
                     )
                     self.emit("deploy_log", f"目标镜像已确认可见：{target_image}")
                 finally:
-                    self._remove_isolated_image_workspace(sftp, workspace)
+                    with trace_stage(self, "workspace_cleanup"):
+                        self._remove_isolated_image_workspace(sftp, workspace)
             if cancel_event and cancel_event.is_set():
                 raise PipelineCancelled("镜像拉取步骤完成，后续步骤已取消")
             self.emit("deploy_progress", (82, "正在更新 Kubernetes YAML..."))
-            self._sftp_update(
-                sftp,
-                yaml_path,
-                lambda text: update_yaml_image(text, package),
-                allow_unchanged=True,
-            )
+            with trace_stage(self, "yaml_update", yaml_path=yaml_path):
+                self._sftp_update(
+                    sftp,
+                    yaml_path,
+                    lambda text: update_yaml_image(text, package),
+                    allow_unchanged=True,
+                )
             if cancel_event and cancel_event.is_set():
                 raise PipelineCancelled("YAML 修改完成，后续应用步骤已取消")
-            self.emit("deploy_progress", (92, "正在应用 Kubernetes 配置..."))
-            self._remote_exec(client, f"cd {shell_quote(data['yaml_dir'])} && {data['apply_command']}")
+            DeployTool._apply_deployment_yaml(self, client, data, cancel_event=cancel_event)
             elapsed = time.monotonic() - started_at
             self.emit("deploy_progress", (100, f"部署完成，共耗时 {elapsed:.1f} 秒"))
             self.emit("deploy_log", f"部署流程执行完成，总耗时 {elapsed:.1f} 秒")
         finally:
             client.close()
 
-    def _execute_deploy_batch(self, entries, batch_token=None):
+    def _apply_deployment_yaml(self, client, data, *, owner=None, cancel_event=None):
+        owner = owner if owner is not None else self
+        if cancel_event and cancel_event.is_set():
+            raise PipelineCancelled("应用 YAML 前已取消，未删除资源")
+        yaml_path = posixpath.join(data["yaml_dir"], data["yaml_file"])
+        prefix = f"cd {shell_quote(data['yaml_dir'])} && "
+        recreate = data.get("delete_before_apply") is True
+        if recreate:
+            command = _deployment_delete_command(data)
+            owner.emit("deploy_progress", (88, "正在删除旧 Kubernetes 资源，随后重新应用..."))
+            owner.emit("deploy_log", f"删除后重新应用：{yaml_path}\n$ {command}")
+            try:
+                with trace_stage(owner, "yaml_delete", yaml_path=yaml_path):
+                    self._remote_exec(client, prefix + command)
+            except Exception as exc:
+                raise RuntimeError(f"删除 YAML 资源失败，已停止后续应用（可能已有部分资源被删除）：{yaml_path}；{exception_message(exc)}") from exc
+        # Once deletion begins, finish apply even if cancellation was requested
+        # meanwhile; stopping between these commands would leave resources absent.
+        owner.emit("deploy_progress", (92, "正在应用 Kubernetes 配置..."))
+        try:
+            with trace_stage(owner, "yaml_apply", yaml_path=yaml_path):
+                self._remote_exec(client, prefix + data["apply_command"])
+        except Exception as exc:
+            if recreate:
+                raise RuntimeError(f"旧资源已删除，但重新应用失败，请检查并重试部署：{yaml_path}；{exception_message(exc)}") from exc
+            raise
+
+    def _apply_manual_deployment_batch(self, client, sftp, entries):
+        for entry in entries:
+            entry.setdefault("result", "未执行")
+        # Prepare every manifest before deleting anything. A later read/write
+        # failure must not leave an earlier application's resources deleted.
+        for index, entry in enumerate(entries, 1):
+            if self.cancel_event.is_set():
+                raise PipelineCancelled("批量应用前已取消，未删除资源")
+            self.emit("deploy_progress", (80, f"正在更新 YAML（{index}/{len(entries)}）..."))
+            try:
+                with trace_stage(self, "yaml_update", yaml_path=entry["yaml_path"]):
+                    self._sftp_update(
+                        sftp, entry["yaml_path"],
+                        lambda text, package=entry["package"]: update_yaml_image(text, package),
+                        allow_unchanged=True,
+                    )
+            except Exception as exc:
+                entry["result"] = f"YAML 更新失败：{exception_message(exc)}"
+                raise
+
+        if self.cancel_event.is_set():
+            raise PipelineCancelled("批量应用前已取消，未删除资源")
+        attempted = []
+        errors = []
+        apply_entries = entries
+        for index, entry in enumerate(entries, 1):
+            data = entry["environment"]
+            if not data.get("delete_before_apply"):
+                continue
+            attempted.append(entry)
+            self.emit("deploy_progress", (88, f"正在统一删除资源（{index}/{len(entries)}）..."))
+            try:
+                with trace_stage(self, "yaml_delete", yaml_path=entry["yaml_path"]):
+                    self._remote_exec(
+                        client, f"cd {shell_quote(data['yaml_dir'])} && " + _deployment_delete_command(data),
+                    )
+            except Exception as exc:
+                entry["result"] = f"删除失败：{exception_message(exc)}"
+                errors.append(f'{entry["package"]} {entry["result"]}')
+                # A failed delete can have removed some resources. Reapply
+                # every attempted target, including that partially deleted one.
+                apply_entries = attempted
+                self.emit("deploy_log", "删除失败，停止后续删除；正在重新应用已尝试删除的 YAML 以恢复资源。")
+                break
+
+        recovering = bool(errors)
+        for index, entry in enumerate(apply_entries, 1):
+            # Once deletion starts, finish the necessary applies even if a
+            # cancellation arrives in between, so resources are not stranded.
+            if not attempted and self.cancel_event.is_set():
+                raise PipelineCancelled("批量部署已取消；已应用的包不会自动回滚")
+            data = entry["environment"]
+            self.emit("deploy_progress", (92, f"正在{'恢复' if recovering else '应用'}资源（{index}/{len(apply_entries)}）..."))
+            previous_error = entry["result"] if entry["result"].startswith("删除失败") else ""
+            try:
+                with trace_stage(self, "yaml_apply", yaml_path=entry["yaml_path"], phase="recovery" if recovering else "apply"):
+                    self._remote_exec(client, f"cd {shell_quote(data['yaml_dir'])} && " + data["apply_command"])
+                entry["result"] = (previous_error + "；" if previous_error else "") + (
+                    "已重新应用以恢复资源" if recovering else "应用成功"
+                )
+            except Exception as exc:
+                entry["result"] = (previous_error + "；" if previous_error else "") + f"应用失败：{exception_message(exc)}"
+                errors.append(f'{entry["package"]} {entry["result"]}')
+            self.emit("deploy_log", f'{entry["package"]}：{entry["result"]}')
+        if errors:
+            raise RuntimeError("批量部署未全部成功：\n" + "\n".join(errors))
+
+    @trace_operation("ssh_batch_deploy")
+    def _execute_deploy_batch(self, entries, batch_token=None, *, unified_apply=False):
         """Transfer all batch images once, then update and apply each YAML."""
+        if unified_apply:
+            parse_deployment_packages("\n".join(entry["package"] for entry in entries))
         coordinator = getattr(self.window_manager, "batch_coordinator", None)
         if coordinator and batch_token:
             coordinator.set_phase(batch_token, "preparing")
             if coordinator.should_join_before_transfer(batch_token):
-                combined = coordinator.collect_pending_entries(
-                    batch_token,
-                    entries,
-                    self.cancel_event,
-                    lambda count: self.emit(
-                        "deploy_progress",
-                        (0, f"检测到 {count} 个同环境任务，等待打包后一起拉镜像..."),
-                    ),
-                )
+                with trace_stage(self, "batch_rejoin_wait"):
+                    combined = coordinator.collect_pending_entries(
+                        batch_token,
+                        entries,
+                        self.cancel_event,
+                        lambda count: self.emit(
+                            "deploy_progress",
+                            (0, f"检测到 {count} 个同环境任务，等待打包后一起拉镜像..."),
+                        ),
+                    )
                 if combined is not entries:
                     raise BatchReassembled(combined)
         active = [entry for entry in entries if not entry["owner"].cancel_event.is_set()]
@@ -7962,13 +8709,25 @@ class DeployTool(QMainWindow):
             )
             previous = selected.get(yaml_key)
             if previous:
+                if unified_apply:
+                    raise ValueError(f'多个应用指向同一 YAML：{data["yaml_dir"]}/{data["yaml_file"]}')
                 previous["owner"].emit(
                     "deploy_log",
                     f'同一 YAML 存在多个包，已由后登记包 {entry["package"]} 覆盖。',
                 )
             selected[yaml_key] = entry
         active = list(selected.values())
-        owners = [entry["owner"] for entry in active]
+        for entry in active:
+            if entry["environment"].get("delete_before_apply") is True:
+                _deployment_delete_command(entry["environment"])
+        owners = list({id(entry["owner"]): entry["owner"] for entry in active}.values())
+        leader_run = getattr(getattr(self, "_diagnostics", None), "run_id", "")
+        participants = [getattr(getattr(owner, "_diagnostics", None), "run_id", "")
+                        for owner in owners]
+        for entry in active:
+            trace_event(entry["owner"], "batch_link", leader=leader_run,
+                        participants=participants, members=len(active), package=entry["package"],
+                        batch_id=str(batch_token[1]) if batch_token else "")
 
         def broadcast(target, payload):
             for owner in owners:
@@ -7978,6 +8737,9 @@ class DeployTool(QMainWindow):
             for entry in active:
                 if entry.get("target_image") == image and not entry["owner"].cancel_event.is_set():
                     entry["owner"].emit("deploy_progress", (percent, status))
+                    if percent == 78:
+                        trace_event(entry["owner"], "image_push_complete", image=image,
+                                    wait_reason="remaining_batch_images_then_validation_and_apply")
 
         lock_keys = sorted({
             self._deployment_target_key("SSH 环境部署", entry["environment"])
@@ -7992,8 +8754,10 @@ class DeployTool(QMainWindow):
                 acquired.append(key)
             data = active[0]["environment"]
             broadcast("deploy_progress", (2, f"合并部署 {len(active)} 个包，正在连接 SSH..."))
-            connect_ssh_client(client, data)
-            sftp = client.open_sftp()
+            with trace_stage(self, "ssh_connect", host=data["host"], port=data.get("port", "22")):
+                connect_ssh_client(client, data)
+            with trace_stage(self, "sftp_connect"):
+                sftp = client.open_sftp()
             transfer_packages = []
             for entry in active:
                 environment = entry["environment"]
@@ -8001,8 +8765,9 @@ class DeployTool(QMainWindow):
                 yaml_path = posixpath.join(
                     environment["yaml_dir"], environment["yaml_file"]
                 )
-                with sftp.open(yaml_path, "r") as remote_yaml:
-                    yaml_content = remote_yaml.read().decode("utf-8", "replace")
+                with trace_stage(entry["owner"], "yaml_read", yaml_path=yaml_path):
+                    with sftp.open(yaml_path, "r") as remote_yaml:
+                        yaml_content = remote_yaml.read().decode("utf-8", "replace")
                 target_image = yaml_image_reference(yaml_content, package)
                 entry["yaml_path"] = yaml_path
                 entry["target_image"] = target_image
@@ -8013,7 +8778,11 @@ class DeployTool(QMainWindow):
                     "docker manifest inspect --insecure "
                     f"{shell_quote(target_image)} >/dev/null 2>&1"
                 )
-                if self._remote_command_succeeded(client, command):
+                with trace_stage(entry["owner"], "image_exists_probe", image=target_image):
+                    image_already_present = self._remote_command_succeeded(client, command)
+                trace_event(entry["owner"], "image_exists_result", image=target_image,
+                            visible=image_already_present)
+                if image_already_present:
                     entry["owner"].emit(
                         "deploy_log", f"目标仓库已有镜像，跳过搬运：{target_image}"
                     )
@@ -8025,24 +8794,26 @@ class DeployTool(QMainWindow):
             if coordinator and batch_token and coordinator.should_join_before_transfer(
                 batch_token
             ):
-                combined = coordinator.collect_pending_entries(
-                    batch_token,
-                    entries,
-                    self.cancel_event,
-                    lambda count: broadcast(
-                        "deploy_progress",
-                        (0, f"拉镜像前发现 {count} 个新任务，等待打包后重新合批..."),
-                    ),
-                )
+                with trace_stage(self, "batch_rejoin_wait"):
+                    combined = coordinator.collect_pending_entries(
+                        batch_token,
+                        entries,
+                        self.cancel_event,
+                        lambda count: broadcast(
+                            "deploy_progress",
+                            (0, f"拉镜像前发现 {count} 个新任务，等待打包后重新合批..."),
+                        ),
+                    )
                 if combined is not entries:
                     raise BatchReassembled(combined)
 
             if transfer_packages:
                 workspace = ""
                 try:
-                    workspace = self._create_isolated_image_workspace(
-                        sftp, data, transfer_packages
-                    )
+                    with trace_stage(self, "workspace_prepare"):
+                        workspace = self._create_isolated_image_workspace(
+                            sftp, data, transfer_packages
+                        )
                     pid_file = posixpath.join(
                         workspace, ".deploy-console-command.pgid"
                     )
@@ -8060,35 +8831,36 @@ class DeployTool(QMainWindow):
                     managed_command = f"sh -c {shell_quote(wait_body)}"
                     if coordinator and batch_token:
                         coordinator.set_phase(batch_token, "pull")
-                    self._remote_exec(
-                        client,
-                        managed_command,
-                        progress_range=(15, 78),
-                        transfer_images=[entry["target_image"] for entry in active
-                                         if entry["package"] in transfer_packages],
-                        on_image_progress=update_image_progress,
-                        interrupt_event=(
-                            coordinator.interrupt_event(batch_token)
-                            if coordinator and batch_token
-                            else None
-                        ),
-                        process_group_file=pid_file,
-                        on_phase=(
-                            lambda phase: coordinator.set_phase(batch_token, phase)
-                            if coordinator and batch_token
-                            else None
-                        ),
-                        interrupt_allowed=(
-                            lambda: coordinator.phase(batch_token) == "pull"
-                            if coordinator and batch_token
-                            else None
-                        ),
-                        on_interrupt_failed=(
-                            lambda: coordinator.cancel_restart(batch_token)
-                            if coordinator and batch_token
-                            else None
-                        ),
-                    )
+                    with trace_stage(self, "image_transfer"):
+                        self._remote_exec(
+                            client,
+                            managed_command,
+                            progress_range=(15, 78),
+                            transfer_images=[entry["target_image"] for entry in active
+                                             if entry["package"] in transfer_packages],
+                            on_image_progress=update_image_progress,
+                            interrupt_event=(
+                                coordinator.interrupt_event(batch_token)
+                                if coordinator and batch_token
+                                else None
+                            ),
+                            process_group_file=pid_file,
+                            on_phase=(
+                                lambda phase: coordinator.set_phase(batch_token, phase)
+                                if coordinator and batch_token
+                                else None
+                            ),
+                            interrupt_allowed=(
+                                lambda: coordinator.phase(batch_token) == "pull"
+                                if coordinator and batch_token
+                                else None
+                            ),
+                            on_interrupt_failed=(
+                                lambda: coordinator.cancel_restart(batch_token)
+                                if coordinator and batch_token
+                                else None
+                            ),
+                        )
                     for entry in active:
                         if entry.get("target_image"):
                             self._wait_for_remote_image(
@@ -8102,22 +8874,24 @@ class DeployTool(QMainWindow):
                             )
                             entry["owner"].emit("deploy_progress", (78, "目标镜像已确认，等待部署..."))
                 finally:
-                    self._remove_isolated_image_workspace(sftp, workspace)
+                    with trace_stage(self, "workspace_cleanup"):
+                        self._remove_isolated_image_workspace(sftp, workspace)
             else:
                 broadcast("deploy_progress", (78, "本轮镜像均已存在，跳过搬运"))
 
             if coordinator and batch_token and coordinator.should_join_before_transfer(
                 batch_token
             ):
-                combined = coordinator.collect_pending_entries(
-                    batch_token,
-                    entries,
-                    self.cancel_event,
-                    lambda count: broadcast(
-                        "deploy_progress",
-                        (0, f"应用 YAML 前发现 {count} 个新任务，重新合批..."),
-                    ),
-                )
+                with trace_stage(self, "batch_rejoin_wait"):
+                    combined = coordinator.collect_pending_entries(
+                        batch_token,
+                        entries,
+                        self.cancel_event,
+                        lambda count: broadcast(
+                            "deploy_progress",
+                            (0, f"应用 YAML 前发现 {count} 个新任务，重新合批..."),
+                        ),
+                    )
                 if combined is not entries:
                     raise BatchReassembled(combined)
 
@@ -8127,6 +8901,11 @@ class DeployTool(QMainWindow):
                 entry for entry in active
                 if not entry["owner"].cancel_event.is_set()
             ]
+            if unified_apply:
+                if len(remaining) != len(active):
+                    raise PipelineCancelled("批量应用前已取消，未删除资源")
+                DeployTool._apply_manual_deployment_batch(self, client, sftp, remaining)
+                return
             for index, entry in enumerate(remaining, 1):
                 environment = entry["environment"]
                 owner = entry["owner"]
@@ -8134,15 +8913,15 @@ class DeployTool(QMainWindow):
                     "deploy_progress",
                     (80, f"正在更新并应用 YAML（{index}/{len(remaining)}）..."),
                 )
-                self._sftp_update(
-                    sftp,
-                    entry["yaml_path"],
-                    lambda text, package=entry["package"]: update_yaml_image(text, package),
-                    allow_unchanged=True,
-                )
-                self._remote_exec(
-                    client,
-                    f"cd {shell_quote(environment['yaml_dir'])} && {environment['apply_command']}",
+                with trace_stage(owner, "yaml_update", yaml_path=entry["yaml_path"]):
+                    self._sftp_update(
+                        sftp,
+                        entry["yaml_path"],
+                        lambda text, package=entry["package"]: update_yaml_image(text, package),
+                        allow_unchanged=True,
+                    )
+                DeployTool._apply_deployment_yaml(
+                    self, client, environment, owner=owner, cancel_event=owner.cancel_event,
                 )
                 owner.emit("deploy_progress", (100, "合并部署完成"))
         finally:
@@ -8497,25 +9276,63 @@ class DeployTool(QMainWindow):
         self.cloud_package.setText(package)
         self._queue_cloud_options(settings, "package", package=package)
 
-    def apply_deployment_targets_from_package(self):
-        """Resolve SSH and Ops deployment targets when package input presses Enter."""
-        package = self.package_input.text().strip().strip("[]")
+    def _on_deployment_package_editing_finished(self):
+        # Jenkins also writes this input. Only user edits should change a
+        # preview on blur, and Enter already resets the modified flag.
+        if self.package_input.isModified():
+            DeployTool._preview_ssh_fields_from_package(self, report_error=False)
+
+    def _preview_ssh_fields_from_package(self, *, report_error=True):
         try:
+            packages = parse_deployment_packages(self.package_input.text())
+            package = packages[0]
+            if hasattr(self, "deploy_package_preview"):
+                preview = self.deploy_package_preview
+                current = preview.currentItem()
+                if current and current.text(0) in packages:
+                    package = current.text(0)
+                preview.blockSignals(True)
+                preview.clear()
+                for item_package in packages:
+                    target = infer_ssh_deployment_config(item_package)
+                    item = QTreeWidgetItem([item_package, posixpath.join(target["yaml_dir"], target["yaml_file"])])
+                    item.setToolTip(0, item_package)
+                    item.setToolTip(1, item.text(1))
+                    preview.addTopLevelItem(item)
+                    if item_package == package:
+                        preview.setCurrentItem(item)
+                preview.blockSignals(False)
+                preview.setFixedHeight(min(160, max(100, preview.header().sizeHint().height()
+                                                    + len(packages) * 32 + 4)))
+                preview.setVisible(len(packages) > 1)
             ssh_target = infer_ssh_deployment_config(package)
         except ValueError as exc:
-            self.message_overlay.show_message("包号无法解析", str(exc))
+            if report_error:
+                self.message_overlay.show_message("包号无法解析", str(exc))
             return
 
         # These values remain unsaved until the user explicitly saves the
         # environment, so trying a package cannot silently rewrite its profile.
-        for key in ("yaml_dir", "yaml_file", "apply_command"):
-            self._set_env_var(key, ssh_target[key])
-        self.env_dirty = True
+        DeployTool._apply_ssh_target_fields(self, ssh_target, mark_dirty=True)
+        self.package_input.setModified(False)
         self.deploy_log.appendPlainText(
             "已按包号解析 SSH 配置："
             f'{ssh_target["yaml_dir"]} / {ssh_target["yaml_file"]} / '
             f'{ssh_target["apply_command"]}'
         )
+        return package if len(packages) == 1 else None
+
+    def _on_deploy_package_selected(self, current, previous=None):
+        if current:
+            DeployTool._apply_ssh_target_fields(
+                self, infer_ssh_deployment_config(current.text(0)), mark_dirty=True,
+            )
+
+    def apply_deployment_targets_from_package(self):
+        """Resolve SSH and Ops deployment targets when package input presses Enter."""
+        package = DeployTool._preview_ssh_fields_from_package(self)
+        if package is None:
+            return
 
         settings = self._cloud_settings_from_ui()
         if any(
@@ -8877,6 +9694,7 @@ class DeployTool(QMainWindow):
         )
         self.emit("cloud_status", "已登录")
 
+    @trace_operation("cloud_deploy")
     def _run_cloud_deploy(self, settings, cancel_event=None):
         try:
             api = self._ensure_cloud_login(settings)
@@ -10177,20 +10995,44 @@ def run_application():
         except (OSError, RuntimeError) as exc:
             QMessageBox.warning(None, "无法启动 Deploy Console", str(exc))
             return 1
+        configure_diagnostics()
         app.setQuitOnLastWindowClosed(False)
         app.setWindowIcon(QIcon(str(resource_path("assets/deploy-console-parallel.png"))))
         app.setStyleSheet(GLOBAL_QSS)
         app.setFont(QFont(FONT_FAMILY, 10))
         manager = ApplicationWindowManager(app)
         instance.activation_requested.connect(manager.restore_from_tray)
-        manager.create_window()
+        first_task = manager.create_window()
+        log_path, log_error = diagnostics_status()
+        if log_error:
+            first_task.emit("build_log", f"耗时日志不可用（{log_error}），请检查 log 目录权限。")
+        elif log_path:
+            first_task.emit("build_log", f"耗时日志：{log_path}")
         return app.exec()
     finally:
+        shutdown_diagnostics()
         instance.close()
 
 
 if __name__ == "__main__":
-    if "--self-test-credentials" in sys.argv:
+    if "--self-test-diagnostics" in sys.argv:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory(prefix="deploy-console-diagnostics-") as test_dir:
+            sink = configure_diagnostics(test_dir)
+            if sink is None:
+                raise RuntimeError("diagnostics initialization failed")
+            trace = new_task_trace(0, kind="self-test", package="synthetic:1")
+            with trace.stage("synthetic_stage"):
+                trace.event("synthetic_event", password="FAKE_SECRET")
+            trace.finish("succeeded")
+            shutdown_diagnostics()
+            content = sink.path.read_text(encoding="utf-8")
+            records = [json.loads(line) for line in content.splitlines()]
+            if "FAKE_SECRET" in content or not any(r["event"] == "task_end" for r in records):
+                raise RuntimeError("diagnostics self-test failed")
+        print("deployment diagnostics: ok")
+    elif "--self-test-credentials" in sys.argv:
         from tempfile import TemporaryDirectory
 
         with TemporaryDirectory(prefix="deploy-console-credentials-") as test_dir:

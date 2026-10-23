@@ -103,7 +103,15 @@ Jenkins 构建成功
 
 日志解析兼容 BuildKit `naming to <镜像> 0.0s done` 以及 DockerBuild 的 `--->` 推送输出前缀；必须保留完整包号匹配，不能仅凭 shell 命令或包号回显判定产出。页面自动按包号查询，四个操作按钮靠右，查询范围说明收在状态行提示中。
 
-包号溯源仅使用 Jenkins，左侧为可选任务树，右侧为包号输入及结果，操作按钮在输入框下方靠右。复用 `JenkinsJobBrowser`、任务缓存和筛选方法，溯源选择独立，清空搜索框时立即取消路径及高亮，再次点击已选任务也可取消；不选路径时按包号自动匹配。任务树上方只保留搜索和刷新，筛选后不可见的任务不再限制查询范围。账号或完整包号变化会使异步返回失效。Ops 溯源入口及专用查询代码已移除，因为部署记录不能提供构建来源；云端部署仍使用原有 Ops API。回归检查见 `test_package_trace.py`、`test_package_trace_ui.py`。85 主机汇总日志尚无已验证的读取入口，未接入。
+包号溯源仅使用 Jenkins，左侧为可选任务树，右侧为包号输入及结果，操作按钮在输入框下方靠右。复用 `JenkinsJobBrowser`、任务缓存和筛选方法，溯源选择独立，清空搜索框时立即取消路径及高亮，再次点击已选任务也可取消；不选路径时按包号自动匹配。任务树上方只保留搜索和刷新，筛选后不可见的任务不再限制查询范围。账号或完整包号变化会使异步返回失效。回归检查见 `test_package_trace.py`、`test_package_trace_ui.py`。85 主机汇总日志尚无已验证的读取入口，未接入。
+
+第四页新增“环境溯源”模式：任务路径确定产品与服务，云区复用目标缓存和 `SearchableComboBox`，但拥有独立选择与异步请求标识。未选任务也可选择当前账号已缓存的云区；无缓存时后台加载，选任务后过滤该服务并保留有效选择。失效选择及空选择在刷新后仍需手动选定，不自动回落到首项。当前环境镜像与构建信息共用下方结果详情。`OpsApiClient.load_current_packages` 每次重新读取精确部署单元；`/api/v3/deployment/record` 的 `imageName` 仅作查询参数，当前包只取 `/api/v3/deployment/instance/data` 返回的 `registry`（公开 Ops 前端同样赋给 `runImageName`）。使用原始 `area` 加 `state=prod/pre` 区分正常与预环境。拒绝多目标、裸版本及无效响应，不回退历史。UI 保存完整运行镜像，Jenkins 检索去掉环境仓库路径以兼容镜像搬运；来源仍需完整包名与 tag 的产出证据。取消在每次请求之间生效。回归见 `test_environment_trace_api.py`、`test_environment_trace_ui.py`。
+
+Jenkins 任务选择及加载环境后同步本地 YAML 预览，保持原 `env_dirty`，不自动保存。启动时冻结 `_preview_yaml`；最终包号与预览不符则停止，旧构建返回也不得覆盖新选任务预览。回归见 `test_deployment_preview.py`。
+
+TAB2 包号失焦或回车会同步两页的 YAML 目录、文件和应用命令，复用 `_apply_ssh_target_fields`；程序写入包号后的失焦不会覆盖所选 Jenkins 任务。删除后重新应用使用可记忆的滑动开关，两页同步；删除命令可编辑，按主机、端口和 YAML 路径保留当前任务的覆盖值，执行前冻结。回归见 `test_delete_apply.py`。
+
+TAB2 支持手动多包部署：每行一个包号，`Shift+Enter` 换行，按产品与服务类型判重；批量预览可选中各包编辑删除命令。复用 `_execute_deploy_batch(..., unified_apply=True)` 共用一次镜像搬运，统一更新所有 YAML 后，按开关选择直接逐个应用或先全部删除再应用。删除失败停止后续删除，重新应用已尝试删除的 YAML（含失败项）；应用失败继续其他包并逐包记录，整批报错。单包和 Jenkins 自动合批保持原执行顺序。回归见 `test_manual_batch_deploy.py`。
 
 2026-10-22 只读核验：`IappPack/ETM/6-SERVICE-5.3.0` 的 `allBuilds` API 当时只返回 #1014～#1018，对应包号尾号 10921～10925；从索引 5 向后读取为空，配置 `numToKeepStr=5`。另检查云应用 ETM 的废弃 SERVICE、HUAWEI、PDF 及二开 ETM SERVICE，合计 5 个任务、19 次现存构建，未命中 `etmbackend-5.3.0:5.3.0.1001.10907`。不能把已被清理的构建说成可通过分页恢复，也不能把包号尾号当成构建编号。
 
@@ -187,7 +195,7 @@ Deepin:  ${XDG_CONFIG_HOME:-~/.config}/BuildDeployToolParallel/config.json
 - 持久缓存必须校验版本、Jenkins 地址、账号和节点结构；手动刷新成功后才覆盖旧缓存，刷新失败时保留已有缓存。
 - `selection_cache` 保存参数定义及云端界面选项，按平台地址、账号及 Job 或云厂商/专案隔离，跨任务和重启复用；缓存命中直接渲染，不创建 Worker。构建参数及分支仅在点击未缓存任务时读取，启动和任务树刷新均不遍历预加载；旧版本完整或部分缓存直接兼容，失败任务再次点击可重试。参数缓存不保存密码参数默认值，配置导出不携带此缓存。异步结果必须校验连接身份和当前请求，旧连接结果不得覆盖新连接。分支刷新只更新对应参数，云端选项加载和刷新仍遍历全部专案，真实部署仍由 API 校验。
 - Git 参数通过 Git Parameter 插件接口读取候选值。
-- `GIT_BRANCH`/`GIT_BRANCH2` 参数旁提供“刷新分支”按钮，通过 Jenkins Git Parameter 接口异步更新当前列表；刷新失败保留原列表，且不重置同一任务的其他参数。
+- `GIT_BRANCH`/`GIT_BRANCH2` 同时存在时共用一个“刷新分支”按钮及候选列表，首次渲染以 `GIT_BRANCH` 候选为准；异步刷新统一请求 `GIT_BRANCH` 一次，同时更新两边候选及缓存，保留各自输入值（含空值）。展开时按钮跨相邻两行；SSH 模式默认收起，外部保留 `CUSTOM_NAME` 和 `GIT_BRANCH2`（不存在时回退 `GIT_BRANCH`）及刷新按钮；云端模式收起时保留 `GIT_BRANCH`。`CUSTOM_NAME` 可独立刷新选项。失败保留旧列表，切任务后忽略旧响应。回归见 `test_build_summary_ui.py`、`test_selection_cache.py`、`test_ui_regressions.py`。
 - 二开任务的 `GIT_BRANCH2` 为空时回退到 `GIT_BRANCH`。
 - 每个 Job 的参数值按任务路径保存。
 - 状态集仅查询当前任务工作区发起的构建，按 Jenkins 连接、Job 路径及 URL 绑定本次构建编号；切换模块使旧请求失效，手动刷新不回退到 `lastBuild`。未打包或排队取消且无编号时隐藏详情；继续打包替换该 Job 上次尝试的绑定。
@@ -358,6 +366,8 @@ Deepin:  dist/DeployConsoleParallel、dist/DeployConsoleParallel-deepin25-x86_64
 Windows 打包配置会在依赖分析前自动从当前进程 PATH 排除 `codex-runtimes` 下的工具目录，避免误收 Poppler 的 `icuuc.dll` 而导致 QtCore 加载失败。切换打包环境后应使用 `--clean`（`build.bat` 已包含）或独立 workpath。可运行 `python -m unittest test_build_spec -v` 回归此隔离规则；交付前必须执行 EXE 的两项自检。
 
 ## 13. 已知风险与后续建议
+
+2026-10-22 耗时诊断：`task_diagnostics.py` 提供异步白名单 JSON 日志，Windows 固定输出到 `D:\AI\tool\deployment-tool-parallel\log`。入口仅在单实例获取成功后初始化；退出刷新队列。`main.py` 的阶段埋点不增加远端探测，也不改变合批/镜像/YAML 执行顺序。按 `batch_link` / `run_id` 关联任务，通过 `image_push_complete`、层状态和 `yaml_apply` 时间分析瓶颈。`batch_wait` 包含跟随任务等待整个批次完成，阶段耗时有嵌套，不能直接累加。回归命令：`python -m unittest test_task_diagnostics test_deployment_diagnostics test_transfer_progress test_remote_deployment -q`；发布另执行 `--self-test-diagnostics`。
 
 ### 跨平台发布
 
