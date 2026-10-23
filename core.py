@@ -186,8 +186,11 @@ def infer_package_target(package):
             "service_type": directory_name,
             "service_label": service_label,
         }
+    mobile = re.match(r"([a-z][a-z0-9]*)mobile(?:[-_.]|$)", normalized_name)
+    if mobile:
+        return {"product": mobile[1], "service_type": "mobile", "service_label": "移动端"}
     raise ValueError(
-        "无法从包号识别产品和服务类型；镜像名需包含 backend、frontend 或 mobilefrontend"
+        "无法从包号识别产品和服务类型；镜像名需包含 backend、frontend、mobile 或 mobilefrontend"
     )
 
 

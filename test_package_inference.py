@@ -24,6 +24,37 @@ class PackageInferenceTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_mobile_and_mobilefrontend_share_deployment_targets(self):
+        for product in ('pqm', 'etm'):
+            for marker in ('mobile', 'mobilefrontend'):
+                with self.subTest(product=product, marker=marker):
+                    package = f'{product}{marker}-hbxx-2.1.0:4.0.0.1000.10001'
+                    ssh = infer_ssh_deployment_config(package)
+                    self.assertEqual(ssh['product'], product)
+                    self.assertEqual(ssh['service_type'], 'mobile')
+                    self.assertEqual(ssh['yaml_dir'], '/data/yaml/app/mobile')
+                    self.assertEqual(ssh['yaml_file'], f'{product}mobile.yaml')
+                    self.assertEqual(ssh['apply_command'], f'kubectl apply -f {product}mobile.yaml')
+                    cloud = infer_cloud_deployment_config(package)
+                    self.assertEqual((cloud['project'], cloud['type_id']), (product + 'mobile', 'frontend'))
+
+    def test_mobile_alias_requires_a_service_name_boundary(self):
+        for package in ('pqmmobilehelper:1', 'pqmmobile123:1'):
+            with self.subTest(package=package), self.assertRaises(ValueError):
+                infer_ssh_deployment_config(package)
+        self.assertEqual(infer_ssh_deployment_config('pqmmobile:1')['yaml_file'], 'pqmmobile.yaml')
+
+    def test_mobile_yaml_update_preserves_other_services_and_products(self):
+        from core import update_yaml_image, yaml_image_reference
+        package = 'pqmmobile-hbxx-2.1.0:4.0.0.1000.10001'
+        other_images = 'image: registry.example/pqmfrontend:old\nimage: registry.example/etmmobile:old\n'
+        for old_name in ('pqmmobile', 'pqmmobilefrontend'):
+            with self.subTest(old_name=old_name):
+                content = f'image: registry.example/{old_name}-other:old\n' + other_images
+                expected = 'image: registry.example/' + package + '\n' + other_images
+                self.assertEqual(update_yaml_image(content, package), expected)
+                self.assertEqual(yaml_image_reference(content, package), 'registry.example/' + package)
+
     def test_ops_values_are_used_instead_of_unchecked_defaults(self):
         client = OpsApiClient()
         client.list_projects = Mock(return_value=["ESC", "ETM"])

@@ -32,6 +32,15 @@ class PackageListTests(unittest.TestCase):
         packages = [ETM, "etmfrontend:1", "etmmobilefrontend:1", PQM]
         self.assertEqual(core.parse_deployment_packages("\n".join(packages)), packages)
 
+    def test_frontend_and_mobile_for_same_product_are_distinct(self):
+        packages = ['pqmfrontend-hbxx-5.2.0:4.0.2.1442', 'pqmmobile-hbxx-2.1.0:4.0.0.1000.10001']
+        self.assertEqual(core.parse_deployment_packages('\n'.join(packages)), packages)
+
+    def test_mobile_aliases_cannot_deploy_the_same_application_twice(self):
+        for other in ('pqmmobile-other:2', 'pqmmobilefrontend-other:2'):
+            with self.subTest(other=other), self.assertRaisesRegex(ValueError, '重复'):
+                core.parse_deployment_packages('pqmmobile-hbxx:1\n' + other)
+
     def test_blank_invalid_and_unknown_product_are_rejected(self):
         for text in ("", "\n ", ETM + "\ninvalid", ETM + "\nunknown:1"):
             with self.assertRaises(ValueError):
@@ -79,6 +88,27 @@ class ManualBatchExecutionTests(unittest.TestCase):
                                           for product in ("etm", "pqm", "esc")])
         self.assertTrue(all(entry["result"] == "应用成功" for entry in self.entries))
         self.client.close.assert_called_once()
+
+    def test_frontend_and_mobile_transfer_once_then_delete_and_apply_own_yaml(self):
+        packages = ['pqmfrontend-hbxx-5.2.0:4.0.2.1442', 'pqmmobile-hbxx-2.1.0:4.0.0.1000.10001']
+        base = self.entries[0]['environment']
+        self.entries = [dict(owner=self.tool, package=package,
+                             environment=core.resolve_ssh_environment_for_package(base, package))
+                        for package in packages]
+        yaml_images = {'/data/yaml/app/frontend/pqm.yaml': 'pqmfrontend',
+                       '/data/yaml/app/mobile/pqmmobile.yaml': 'pqmmobile'}
+        self.client.open_sftp.return_value.open.side_effect = lambda path, mode: io.BytesIO(
+            f'image: registry.example/{yaml_images[path]}:old\n'.encode())
+        self.execute()
+        self.tool._create_isolated_image_workspace.assert_called_once()
+        self.assertEqual(self.tool._create_isolated_image_workspace.call_args.args[2], packages)
+        commands = [call.args[1] for call in self.tool._remote_exec.call_args_list]
+        self.assertEqual(commands[1:], [
+            f'cd {directory} && kubectl {action} -f {filename}'
+            for action in ('delete', 'apply')
+            for directory, filename in (('/data/yaml/app/frontend', 'pqm.yaml'),
+                                        ('/data/yaml/app/mobile', 'pqmmobile.yaml'))])
+        self.assertTrue(all(entry['result'] == '应用成功' for entry in self.entries))
 
     def test_off_only_applies_and_existing_images_skip_transfer(self):
         self.tool._remote_command_succeeded.return_value = True
@@ -187,6 +217,26 @@ class ManualBatchUiTests(unittest.TestCase):
         self.assertIn("pqm.yaml", preview.topLevelItem(0).text(1))
         preview.setCurrentItem(preview.topLevelItem(1))
         self.assertEqual(self.tool._get_env_var("yaml_file"), "etm.yaml")
+
+    def test_frontend_and_mobile_preview_and_submit_distinct_targets(self):
+        packages = ['pqmfrontend-hbxx-5.2.0:4.0.2.1442', 'pqmmobile-hbxx-2.1.0:4.0.0.1000.10001']
+        self.tool.package_input.setText('\n'.join(packages))
+        self.tool._preview_ssh_fields_from_package()
+        preview = self.tool.deploy_package_preview
+        self.assertEqual(preview.topLevelItemCount(), 2)
+        self.assertEqual(preview.topLevelItem(0).text(1), '/data/yaml/app/frontend/pqm.yaml')
+        self.assertEqual(preview.topLevelItem(1).text(1), '/data/yaml/app/mobile/pqmmobile.yaml')
+        preview.setCurrentItem(preview.topLevelItem(1))
+        self.assertEqual(self.tool.deploy_delete_option.command.text(), 'kubectl delete -f pqmmobile.yaml')
+        self.tool._run_manual_deployment_batch = Mock()
+        with patch.object(main.QMessageBox, 'warning') as warning:
+            self.tool.start_deploy()
+        warning.assert_not_called()
+        self.tool.run_thread.assert_called_once()
+        self.tool.run_thread.call_args.args[0]()
+        entries = self.tool._run_manual_deployment_batch.call_args.args[0]
+        self.assertEqual([e['package'] for e in entries], packages)
+        self.assertEqual([e['environment']['yaml_file'] for e in entries], ['pqm.yaml', 'pqmmobile.yaml'])
 
     def test_duplicate_application_starts_nothing(self):
         self.tool.package_input.setText(ETM + "\netmbackend-other:2")
