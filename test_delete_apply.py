@@ -32,7 +32,7 @@ class DeleteApplyExecutionTests(unittest.TestCase):
         self.apply()
         commands = [call.args[1] for call in self.tool._remote_exec.call_args_list]
         self.assertEqual(commands, [
-            "cd /data/yaml/app/backend && kubectl delete -f etm.yaml --ignore-not-found=true --timeout=120s",
+            "cd /data/yaml/app/backend && kubectl delete -f etm.yaml",
             "cd /data/yaml/app/backend && kubectl apply -f etm.yaml"])
 
     def test_custom_delete_command_is_executed_exactly(self):
@@ -87,7 +87,7 @@ class DeleteApplyExecutionTests(unittest.TestCase):
         self.apply()
         command = self.tool._remote_exec.call_args_list[0].args[1]
         self.assertEqual(command,
-            "cd '/yaml folder' && kubectl delete -f 'etm file.yaml' --ignore-not-found=true --timeout=120s")
+            "cd '/yaml folder' && kubectl delete -f 'etm file.yaml'")
 
     def test_single_deployment_derives_delete_from_package_instead_of_stale_yaml(self):
         client = Mock()
@@ -303,12 +303,12 @@ class DeleteApplyUiTests(unittest.TestCase):
             self.tool.package_input.setText(package)
             self.tool._preview_ssh_fields_from_package()
             for option in (self.tool.build_delete_option, self.tool.deploy_delete_option):
-                self.assertIn("kubectl delete -f " + filename, option.command.text())
+                self.assertEqual("kubectl delete -f " + filename, option.command.text())
                 self.assertTrue(option.checkbox.isChecked())
         self.tool.current_job_path = ["custom-dev", "16-ETM", "3-SERVICE"]
         self.tool.current_display_path = self.tool.current_job_path
         self.tool._sync_ssh_target_from_job()
-        self.assertIn("kubectl delete -f etm.yaml", self.tool.build_delete_option.command.text())
+        self.assertEqual("kubectl delete -f etm.yaml", self.tool.build_delete_option.command.text())
 
     def test_collapsing_moves_same_switch_between_header_and_actions(self):
         option = self.tool.build_delete_option

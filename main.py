@@ -261,7 +261,7 @@ def _yaml_delete_command(yaml_file):
     filename = str(yaml_file or "").strip()
     if not filename:
         raise ValueError("未选择 YAML 文件，无法生成删除命令")
-    return f"kubectl delete -f {shell_quote(filename)} --ignore-not-found=true --timeout=120s"
+    return f"kubectl delete -f {shell_quote(filename)}"
 
 
 def _deployment_delete_command(data):
