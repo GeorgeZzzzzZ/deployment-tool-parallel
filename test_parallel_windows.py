@@ -521,7 +521,7 @@ class ParallelWindowTests(unittest.TestCase):
                 cancel_button, remove_button = manager.task_center._actions[first]
                 self.assertEqual(cancel_button.text(), "停止")
                 self.assertEqual(remove_button.text(), "移除")
-                self.assertEqual(manager.task_center.tree.columnWidth(6), 184)
+                self.assertEqual(manager.task_center.tree.columnWidth(7), 184)
                 self.assertEqual(cancel_button.width(), 68)
                 self.assertEqual(remove_button.width(), 68)
                 self.assertGreaterEqual(

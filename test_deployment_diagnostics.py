@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from main import DeployTool
+from main import DeployTool, ReplacedPackageCapture
 from task_diagnostics import DiagnosticLog, TaskTrace
 
 
@@ -165,6 +165,7 @@ class DeploymentDiagnosticsTests(unittest.TestCase):
 
     def test_tracked_task_finishes_once_and_includes_total_duration(self):
         self.owner.task_number = 3
+        self.owner._replaced_packages = ReplacedPackageCapture()
         self.owner._notify_task_summary = Mock()
         with patch("main.new_task_trace", return_value=self.trace) as factory:
             DeployTool._begin_tracked_task(self.owner, "SSH 部署", "环境3", package="etm:1")

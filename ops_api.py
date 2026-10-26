@@ -432,11 +432,14 @@ class OpsApiClient:
         """Read the selected Ops runtime image, independently of option caches."""
         self._check_environment_cancelled(cancel_event)
         target = self._current_package_target(settings, cancel_event=cancel_event)
+        return self._load_current_packages_for_target(target, cancel_event)
+
+    def _load_current_packages_for_target(self, target, cancel_event=None, *, request_timeout=60):
         self._check_environment_cancelled(cancel_event)
         payload = self._data(self._bff(
             "GET", "/api/v3/deployment/record",
             params={"data_id": target["id"], "cloud": target["cloud"], "state": target["state"]},
-            timeout=60,
+            timeout=request_timeout,
         ))
         self._check_environment_cancelled(cancel_event)
         records = payload.get("data") if isinstance(payload, dict) else payload
@@ -456,7 +459,7 @@ class OpsApiClient:
                     "app_id": target["appId"], "type": target["typeId"],
                     "deployment_name": target["deploymentName"], "state": target["state"],
                     "image_name": hint},
-            timeout=60,
+            timeout=request_timeout,
         ))
         self._check_environment_cancelled(cancel_event)
         image = runtime.get("registry") if isinstance(runtime, dict) else None
@@ -520,8 +523,10 @@ class OpsApiClient:
         # full row detects both a new record and an in-place status/time update.
         return json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
 
-    def deploy(self, settings):
+    def deploy(self, settings, *, on_target_resolved=None, before_submit=None):
         target = self.resolve_target(settings)
+        if on_target_resolved:
+            on_target_resolved(target)
         package = settings.get("package", "")
         self.verify_package(target, package)
         type_id = str(target.get("typeId", ""))
@@ -544,6 +549,8 @@ class OpsApiClient:
             "userName": self.user.get("userName", ""),
             "name": deploy_name,
         }
+        if before_submit:
+            before_submit()
         try:
             response = self._bff("POST", path, json=body, timeout=60)
         except OpsApiError as exc:

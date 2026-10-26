@@ -71,6 +71,7 @@ from core import (
 from ops_api import (
     OpsApiClient, OpsApiError, OpsSubmissionUnknown, service_type_id, service_type_label,
 )
+from replaced_packages import ReplacedPackageCapture, read_ssh_running_packages
 from package_trace import (
     JenkinsHistorySource, format_trace_match, parse_packages, trace_packages, trace_result_fields,
     job_service_type, TraceCancelled,
@@ -3221,6 +3222,7 @@ class DeployTool(QMainWindow):
         self._task_title = "等待配置"
         self._task_target = ""
         self._task_package = ""
+        self._replaced_packages = ReplacedPackageCapture(initial="-")
         self._task_phase = "未开始"
         self._task_progress = 0
         self._task_failed = False
@@ -3340,6 +3342,10 @@ class DeployTool(QMainWindow):
             manager.update_task(self)
 
     def _begin_tracked_task(self, kind, target, package="", title=""):
+        self._replaced_packages.freeze()
+        self._replaced_packages = ReplacedPackageCapture(
+            initial="不涉及" if kind == "Jenkins 打包" else "待读取"
+        )
         self._diagnostics = new_task_trace(
             getattr(self, "task_number", 0), kind=kind, target=target,
             package=package, title=title,
@@ -3361,6 +3367,7 @@ class DeployTool(QMainWindow):
     def _finish_tracked_task(self):
         if not getattr(self, "_task_runtime_active", False):
             return
+        self._replaced_packages.freeze()
         terminal_text = self._task_phase
         if self._task_failed or any(
             word in terminal_text for word in ("失败", "错误", "未知")
@@ -3390,6 +3397,7 @@ class DeployTool(QMainWindow):
         )
 
     def task_summary(self):
+        replaced = self._replaced_packages.snapshot()
         end = time.monotonic()
         if self._task_finished_at is not None:
             end = self._task_finished_at
@@ -3403,6 +3411,9 @@ class DeployTool(QMainWindow):
             "title": self._task_title,
             "target": self._task_target,
             "package": self._task_package,
+            "replaced_packages": replaced["packages"],
+            "replaced_text": replaced["text"],
+            "replaced_tooltip": replaced["tooltip"],
             "phase": self._task_phase,
             "progress": self._task_progress,
             "elapsed": elapsed,
@@ -8482,11 +8493,37 @@ class DeployTool(QMainWindow):
         finally:
             self._release_deployment_target(target_key)
 
+    def _start_ssh_replaced_packages(self, data, package):
+        capture = getattr(self, "_replaced_packages", None)
+        if capture is None:
+            return
+        environment = dict(data)
+        key = posixpath.join(environment["yaml_dir"], environment["yaml_file"])
+
+        def read(cancel):
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                if cancel.is_set():
+                    return []
+                connect_ssh_client(client, environment)
+                return read_ssh_running_packages(client, environment, package, cancel)
+            finally:
+                client.close()
+
+        capture.start(key, read)
+
+    def _freeze_replaced_packages(self, data=None):
+        capture = getattr(self, "_replaced_packages", None)
+        if capture is not None:
+            capture.freeze(posixpath.join(data["yaml_dir"], data["yaml_file"]) if data else None)
+
     @trace_operation("ssh_deploy")
     def _execute_deploy(self, data, package, cancel_event=None):
         data = resolve_ssh_environment_for_package(data, package)
         if data.get("delete_before_apply") is True:
             _deployment_delete_command(data)
+        DeployTool._start_ssh_replaced_packages(self, data, package)
         started_at = time.monotonic()
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -8577,12 +8614,14 @@ class DeployTool(QMainWindow):
             self.emit("deploy_progress", (100, f"部署完成，共耗时 {elapsed:.1f} 秒"))
             self.emit("deploy_log", f"部署流程执行完成，总耗时 {elapsed:.1f} 秒")
         finally:
+            DeployTool._freeze_replaced_packages(self, data)
             client.close()
 
     def _apply_deployment_yaml(self, client, data, *, owner=None, cancel_event=None):
         owner = owner if owner is not None else self
         if cancel_event and cancel_event.is_set():
             raise PipelineCancelled("应用 YAML 前已取消，未删除资源")
+        DeployTool._freeze_replaced_packages(owner, data)
         yaml_path = posixpath.join(data["yaml_dir"], data["yaml_file"])
         prefix = f"cd {shell_quote(data['yaml_dir'])} && "
         recreate = data.get("delete_before_apply") is True
@@ -8628,6 +8667,8 @@ class DeployTool(QMainWindow):
 
         if self.cancel_event.is_set():
             raise PipelineCancelled("批量应用前已取消，未删除资源")
+        for entry in entries:
+            DeployTool._freeze_replaced_packages(entry["owner"], entry["environment"])
         attempted = []
         errors = []
         apply_entries = entries
@@ -8752,6 +8793,10 @@ class DeployTool(QMainWindow):
             for key in lock_keys:
                 self._wait_for_deployment_target(key, log_target="deploy_log")
                 acquired.append(key)
+            for entry in active:
+                DeployTool._start_ssh_replaced_packages(
+                    entry["owner"], entry["environment"], entry["package"]
+                )
             data = active[0]["environment"]
             broadcast("deploy_progress", (2, f"合并部署 {len(active)} 个包，正在连接 SSH..."))
             with trace_stage(self, "ssh_connect", host=data["host"], port=data.get("port", "22")):
@@ -8925,6 +8970,8 @@ class DeployTool(QMainWindow):
                 )
                 owner.emit("deploy_progress", (100, "合并部署完成"))
         finally:
+            for entry in active:
+                DeployTool._freeze_replaced_packages(entry["owner"], entry["environment"])
             client.close()
             for key in reversed(acquired):
                 self._release_deployment_target(key)
@@ -9707,7 +9754,32 @@ class DeployTool(QMainWindow):
                 f'{settings["region"]}',
             )
             self.emit("cloud_log", f'正在校验镜像包：{settings["package"]}')
-            result = api.deploy(settings)
+            capture = getattr(self, "_replaced_packages", None)
+            if capture is None:
+                result = api.deploy(settings)
+            else:
+                def start_lookup(target):
+                    # Isolate HTTP session/cache state from the submitting client.
+                    headers = dict(api.headers)
+                    cookies = api.session.cookies.copy()
+                    frozen_target = copy.deepcopy(target)
+
+                    def read(cancel):
+                        reader = OpsApiClient(timeout=8)
+                        reader.headers = headers
+                        reader.session.cookies.update(cookies)
+                        reader.authenticated = True
+                        try:
+                            return reader._load_current_packages_for_target(
+                                frozen_target, cancel, request_timeout=8
+                            )["packages"]
+                        finally:
+                            reader.session.close()
+
+                    capture.start(settings["package"], read)
+
+                result = api.deploy(settings, on_target_resolved=start_lookup,
+                                    before_submit=capture.freeze)
             target = result["target"]
             self.emit(
                 "cloud_log",
@@ -9732,6 +9804,8 @@ class DeployTool(QMainWindow):
             self.emit("cloud_log", f"云端部署失败：{exception_message(exc)}")
             self.emit("cloud_status", "部署失败")
             raise
+        finally:
+            DeployTool._freeze_replaced_packages(self)
 
     def _run_cloud_deploy_with_target_lock(self, settings):
         target_key = self._deployment_target_key(
@@ -10486,9 +10560,9 @@ class TaskCenterPanel(GlassBackground):
         body_layout.setContentsMargins(12, 0, 12, 10)
         body_layout.setSpacing(0)
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(7)
+        self.tree.setColumnCount(8)
         self.tree.setHeaderLabels(
-            ("任务", "包号 / Job", "目标", "当前阶段", "进度", "用时", "操作")
+            ("任务", "包号 / Job", "目标", "当前阶段", "被替换包号", "进度", "用时", "操作")
         )
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
@@ -10502,17 +10576,18 @@ class TaskCenterPanel(GlassBackground):
         header_view.setSectionResizeMode(1, QHeaderView.Stretch)
         header_view.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header_view.setSectionResizeMode(3, QHeaderView.Stretch)
-        header_view.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(4, QHeaderView.Stretch)
         header_view.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header_view.setSectionResizeMode(6, QHeaderView.Fixed)
-        self.tree.setColumnWidth(6, 184)
+        header_view.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(7, QHeaderView.Fixed)
+        self.tree.setColumnWidth(7, 184)
         self.tree.itemClicked.connect(self._activate_item)
         self.tree.itemDoubleClicked.connect(self._activate_item)
         copy_action = QAction("复制包号", self.tree)
         copy_action.setShortcut(QKeySequence.Copy)
         copy_action.setShortcutContext(Qt.WidgetShortcut)
         copy_action.triggered.connect(
-            lambda: self._copy_package(self.tree.currentItem())
+            lambda: self._copy_package(self.tree.currentItem(), self.tree.currentColumn())
         )
         self.tree.addAction(copy_action)
         body_layout.addWidget(self.tree)
@@ -10526,9 +10601,9 @@ class TaskCenterPanel(GlassBackground):
 
     def add_task(self, task):
         item = QTreeWidgetItem(self.tree)
-        item.setTextAlignment(4, Qt.AlignCenter)
         item.setTextAlignment(5, Qt.AlignCenter)
-        item.setSizeHint(6, QSize(160, 50))
+        item.setTextAlignment(6, Qt.AlignCenter)
+        item.setSizeHint(7, QSize(160, 50))
         self._items[task] = item
 
         actions = QWidget()
@@ -10551,7 +10626,7 @@ class TaskCenterPanel(GlassBackground):
         remove_button.setFixedSize(68, 30)
         remove_button.clicked.connect(lambda: self.manager.remove_task(task))
         actions_layout.addWidget(remove_button)
-        self.tree.setItemWidget(item, 6, actions)
+        self.tree.setItemWidget(item, 7, actions)
         self._actions[task] = (cancel_button, remove_button)
         apply_ui_icons(actions)
         self.update_task(task)
@@ -10588,11 +10663,16 @@ class TaskCenterPanel(GlassBackground):
         item.setToolTip(2, summary["target"] or "-")
         item.setText(3, summary["phase"] or "未开始")
         item.setToolTip(3, summary["phase"] or "未开始")
+        item.setText(4, summary["replaced_text"])
+        item.setData(4, Qt.UserRole, "\n".join(summary["replaced_packages"]))
+        item.setToolTip(4, summary["replaced_tooltip"] + (
+            "\n点击复制被替换包号" if summary["replaced_packages"] else ""
+        ))
         item.setText(
-            4,
+            5,
             f"{summary['progress']}%" if summary["state"] != "idle" else "-",
         )
-        item.setText(5, self._format_elapsed(summary["elapsed"]))
+        item.setText(6, self._format_elapsed(summary["elapsed"]))
         color = QColor(self._STATE_COLORS.get(summary["state"], COLORS["text_muted"]))
         item.setForeground(0, QBrush(color))
         item.setForeground(3, QBrush(color))
@@ -10633,20 +10713,21 @@ class TaskCenterPanel(GlassBackground):
         self.tree.setCurrentItem(item)
         self.tree.blockSignals(False)
 
-    def _copy_package(self, item):
-        package = item.data(1, Qt.UserRole) if item is not None else ""
+    def _copy_package(self, item, column=1):
+        column = 4 if column == 4 else 1
+        package = item.data(column, Qt.UserRole) if item is not None else ""
         if not package:
             return
         QApplication.clipboard().setText(package)
-        self.copy_feedback.setText("已复制包号")
+        self.copy_feedback.setText("已复制被替换包号" if column == 4 else "已复制包号")
         self._copy_feedback_timer.start(2500)
 
     def _activate_item(self, item, column=0):
         for task, candidate in self._items.items():
             if candidate is item:
                 self.manager.activate_task(task)
-                if column == 1:
-                    self._copy_package(item)
+                if column in (1, 4):
+                    self._copy_package(item, column)
                 return
 
     def _update_counter(self):

@@ -44,6 +44,7 @@ def load_deployment_code():
         "_probe_remote_image", "_wait_for_remote_image", "_deployment_target_key",
         "_create_isolated_image_workspace", "_remove_isolated_image_workspace",
         "_apply_deployment_yaml",
+        "_start_ssh_replaced_packages", "_freeze_replaced_packages",
     }
     selected = []
     for node in tree.body:
