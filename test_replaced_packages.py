@@ -162,7 +162,10 @@ class CloudCutoffTests(unittest.TestCase):
         api.resolve_target = lambda settings: target
         api.verify_package = lambda *args: events.append("verify")
         api._deployment_records = Mock(side_effect=[[], [{"imageName": NEW}]])
-        api._bff = lambda *args, **kwargs: events.append("submit")
+        def submit(*args, **kwargs):
+            kwargs["before_request"]()
+            events.append("submit")
+        api._bff = submit
         self.assertIn("before_submit", __import__("inspect").signature(api.deploy).parameters,
                       "部署提交前没有关闭查询窗口")
         result = api.deploy({"package": NEW},
@@ -192,6 +195,7 @@ class CloudCutoffTests(unittest.TestCase):
             if path == "/api/v3/deployment/record":
                 return {"data": [{"imageName": OLD}]}
             self.assertEqual(method, "POST")
+            kwargs["before_request"]()
             self.assertEqual(capture.snapshot()["text"], "未获取")
             self.assertFalse(release.is_set(), "部署不应等待运行包号响应")
             return {}

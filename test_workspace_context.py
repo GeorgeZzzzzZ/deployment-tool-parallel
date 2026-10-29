@@ -88,7 +88,7 @@ class WorkspaceContextTests(unittest.TestCase):
             tasks[images.index(image)]._on_deploy_progress(percent, text)
         self.app.processEvents()
         self.assertEqual([task._task_progress for task in tasks], [75, 70, 70])
-        self.assertEqual([self.manager.task_center._items[task].text(4) for task in tasks],
+        self.assertEqual([self.manager.task_center._items[task].text(5) for task in tasks],
                          ["75%", "70%", "70%"])
         self.assertIn("50%", tasks[0].deploy_progress_label.text())
         self.assertTrue(all(task.deploy_progress_label.text() == "等待拉取镜像..." for task in tasks[1:]))

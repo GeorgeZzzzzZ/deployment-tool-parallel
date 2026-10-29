@@ -15,6 +15,7 @@ import time
 import uuid
 import webbrowser
 from ctypes import wintypes
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from shlex import quote as shell_quote
@@ -301,6 +302,20 @@ class RemoteCommandInterrupted(PipelineCancelled):
     """The managed remote image command was intentionally stopped for rebatching."""
 
 
+class RemoteCommandUncertain(RuntimeError):
+    """A remote command may still be running; do not reuse its deployment target."""
+
+
+class DeploymentCancellation:
+    def __init__(self, owners, *, require_all=False):
+        self.owners = tuple(owners)
+        self.require_all = require_all
+
+    def is_set(self):
+        states = [owner.cancel_event.is_set() for owner in self.owners]
+        return bool(states) and (all(states) if self.require_all else any(states))
+
+
 class BatchReassembled(RuntimeError):
     """Restart batch preparation with newly collected entries before transfer."""
 
@@ -484,6 +499,30 @@ class DockerImageProgress:
                 f"{state['last'][2]}；等待远端输出，命令已运行 {elapsed} 秒")
 
 
+@contextmanager
+def ssh_request_deadline(client, timeout=30):
+    """Channel IO timeouts do not bound Paramiko's request-acknowledgement wait."""
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        client.close()
+
+    watchdog = threading.Timer(timeout, expire)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        yield
+    except Exception as exc:
+        if expired.is_set():
+            raise TimeoutError("SSH 请求响应超时，连接已关闭") from exc
+        raise
+    finally:
+        watchdog.cancel()
+    if expired.is_set():
+        raise TimeoutError("SSH 请求响应超时，连接已关闭")
+
+
 def connect_ssh_client(client, data):
     """Connect with password-only settings suitable for slower SSH servers."""
     client.connect(
@@ -497,6 +536,7 @@ def connect_ssh_client(client, data):
         # seconds. Keep transport failures bounded while allowing that normal
         # server-side delay to complete.
         auth_timeout=30,
+        channel_timeout=30,
         look_for_keys=False,
         allow_agent=False,
     )
@@ -891,20 +931,31 @@ class DeploymentTargetCoordinator:
     def __init__(self):
         self._condition = threading.Condition()
         self._owners = {}
+        self._blocked = {}
 
     def acquire(self, owner, key, cancel_event=None, on_wait=None):
         if not key:
             return
         announced = False
         with self._condition:
-            while key in self._owners and self._owners[key] is not owner:
+            while True:
+                if key in self._blocked:
+                    raise RemoteCommandUncertain(self._blocked[key])
                 if cancel_event and cancel_event.is_set():
                     raise PipelineCancelled("等待部署目标期间已取消")
+                if key not in self._owners or self._owners[key] is owner:
+                    break
                 if not announced and on_wait:
                     on_wait()
                     announced = True
                 self._condition.wait(timeout=0.25)
             self._owners[key] = owner
+
+    def block(self, owner, key, reason):
+        with self._condition:
+            if key and self._owners.get(key, owner) is owner:
+                self._blocked[key] = reason
+                self._condition.notify_all()
 
     def release(self, owner, key):
         if not key:
@@ -3115,6 +3166,7 @@ class DeployTool(QMainWindow):
     sig_pipeline_location = Signal(str, str)
     sig_cloud_status = Signal(str)
     sig_cloud_log = Signal(str)
+    sig_cloud_session_result = Signal(object)
     sig_cloud_options = Signal(object)
     sig_open_cloud_status = Signal(object)
     sig_cloud_status_fallback = Signal(object, str)
@@ -3190,6 +3242,12 @@ class DeployTool(QMainWindow):
         self.ops_api = None
         self._ops_api_identity = None
         self._ops_login_lock = threading.Lock()
+        self._ops_session_state_lock = threading.Lock()
+        self._ops_session_generation = 0
+        self._ops_expected_identity = None
+        self._ops_session_disposed = threading.Event()
+        self._ops_session_thread = None
+        self._ops_maintenance_failed = False
         self._cloud_option_requests = {"build": 0, "tab": 0}
         self._selected_module_path = []
         self._preview_ssh_target = None
@@ -3242,6 +3300,10 @@ class DeployTool(QMainWindow):
             Qt.WidgetWithChildrenShortcut if embedded else Qt.WindowShortcut
         )
         self._new_task_shortcut.activated.connect(self.request_new_task_window)
+        self._ops_session_timer = QTimer(self)
+        self._ops_session_timer.setInterval(60000)
+        self._ops_session_timer.timeout.connect(self._maintain_cloud_session)
+        self._ops_session_timer.start()
 
     def _connect_signals(self):
         self.sig_build_log.connect(self._on_build_log)
@@ -3267,6 +3329,7 @@ class DeployTool(QMainWindow):
         self.sig_pipeline_location.connect(self._on_pipeline_location)
         self.sig_cloud_status.connect(self._on_cloud_status)
         self.sig_cloud_log.connect(self._on_cloud_log)
+        self.sig_cloud_session_result.connect(self._on_cloud_session_result)
         self.sig_cloud_options.connect(self._on_cloud_options)
         self.sig_open_cloud_status.connect(self._on_open_cloud_status)
         self.sig_cloud_status_fallback.connect(self._on_cloud_status_fallback)
@@ -3438,6 +3501,9 @@ class DeployTool(QMainWindow):
         self._launch_build(self._last_build_snapshot)
 
     def shutdown_resources(self):
+        self._ops_session_disposed.set()
+        self._ops_session_timer.stop()
+        self._discard_cloud_session()
         self._summary_timer.stop()
         self._summary_request = None
         if self.window_manager:
@@ -3964,8 +4030,7 @@ class DeployTool(QMainWindow):
         self._parameter_requests.clear()
         self._active_parameter_key = None
         self._displayed_parameter_key = None
-        self.ops_api = None
-        self._ops_api_identity = None
+        self._discard_cloud_session()
         for source in self._cloud_option_requests:
             self._cloud_option_requests[source] += 1
         self._selected_module_path = []
@@ -7297,6 +7362,12 @@ class DeployTool(QMainWindow):
         if window_manager:
             window_manager.target_coordinator.release(self, key)
 
+    def _block_deployment_target(self, key, reason):
+        manager = getattr(self, "window_manager", None)
+        coordinator = getattr(manager, "target_coordinator", None)
+        if coordinator:
+            coordinator.block(self, key, str(reason))
+
     def start_build(self):
         if getattr(self, "_task_runtime_active", False):
             self.message_overlay.show_message(
@@ -7611,7 +7682,7 @@ class DeployTool(QMainWindow):
                                     active_entries = reassembled.entries
                                     self.emit(
                                         "deploy_log",
-                                        f"已在拉镜像前重新合批，共 {len(active_entries)} 个任务。",
+                                        f"已按剩余有效任务重新合批，共 {len(active_entries)} 个任务。",
                                     )
                                 except RemoteCommandInterrupted:
                                     self.emit(
@@ -7623,7 +7694,9 @@ class DeployTool(QMainWindow):
                                             self.window_manager.batch_coordinator.collect_pending_entries(
                                                 batch_token,
                                                 active_entries,
-                                                self.cancel_event,
+                                                DeploymentCancellation(
+                                                    [entry["owner"] for entry in active_entries], require_all=True,
+                                                ),
                                                 lambda count: self.emit(
                                                     "deploy_progress",
                                                     (
@@ -7711,7 +7784,8 @@ class DeployTool(QMainWindow):
         if self.pipeline_phase == "deploy":
             message = (
                 "当前处于环境部署阶段。\n\n"
-                "取消后会等待正在执行的步骤结束，然后停止后续部署步骤。是否继续？"
+                "将停止本任务的镜像搬运和等待，跳过后续部署。共享批次中的其他任务会继续。\n"
+                "若已开始删除或应用 Kubernetes 资源，将完成当前必要收尾。是否继续？"
             )
         elif self.pipeline_phase == "cloud_deploy":
             message = (
@@ -7726,8 +7800,10 @@ class DeployTool(QMainWindow):
             return
         self.cancel_event.set()
         self.cancel_button.setEnabled(False)
-        if self.pipeline_phase in ("deploy", "cloud_deploy"):
-            self._update_build_status("已请求取消，等待当前部署步骤结束...")
+        if self.pipeline_phase == "deploy":
+            self._update_build_status("正在取消，确认远端停止并完成必要收尾...")
+        elif self.pipeline_phase == "cloud_deploy":
+            self._update_build_status("已请求取消，等待当前云端请求返回...")
         else:
             self._update_build_status("正在终止 Jenkins 构建...")
             phase = self.pipeline_phase
@@ -8124,10 +8200,19 @@ class DeployTool(QMainWindow):
         transfer_images=None,
         on_progress=None,
         on_image_progress=None,
+        cancel_event=None,
+        timeout_seconds=None,
+        idle_timeout_seconds=None,
     ):
         """Execute a remote command without flooding Qt with TTY redraws."""
+        if cancel_event and cancel_event.is_set():
+            raise PipelineCancelled("远端命令启动前已取消")
         self.emit("deploy_log", "$ " + command)
-        stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+        try:
+            with ssh_request_deadline(client, 15):
+                stdin, stdout, stderr = client.exec_command(command, get_pty=True, timeout=15)
+        except Exception as exc:
+            raise RemoteCommandUncertain("无法确认远端命令是否启动或停止，请检查服务器后重启工具") from exc
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
         last_log_line = ""
@@ -8136,6 +8221,8 @@ class DeployTool(QMainWindow):
         transfer_phase = ""
         transfer_range = progress_range
         command_started_at = time.monotonic()
+        timeout_seconds = timeout_seconds if timeout_seconds is not None else (3600 if progress_range else 300)
+        idle_timeout_seconds = idle_timeout_seconds if idle_timeout_seconds is not None else (600 if progress_range else 0)
         last_activity_at = command_started_at
         last_heartbeat_at = command_started_at
         image_progress = DockerImageProgress(transfer_images, progress_range) if transfer_images and progress_range else None
@@ -8227,6 +8314,23 @@ class DeployTool(QMainWindow):
                     last_log_line = line
 
         code = None
+        stopped = False
+
+        def stop_command():
+            nonlocal stopped
+            try:
+                if not process_group_file:
+                    raise RuntimeError("当前命令没有可确认的进程组")
+                self._terminate_remote_process_group(client, process_group_file)
+                stopped = True
+            except Exception as exc:
+                raise RemoteCommandUncertain(
+                    "无法确认远端命令已停止，已停止本地等待并阻止该目标的后续部署。"
+                    "请检查服务器上的命令及资源状态，确认后重新启动工具。"
+                ) from exc
+            finally:
+                stdout.channel.close()
+
         try:
             while not stdout.channel.exit_status_ready():
                 if transfer_trace:
@@ -8235,6 +8339,9 @@ class DeployTool(QMainWindow):
                     consume(decoder.decode(stdout.channel.recv(65536)))
                 if stdout.channel.recv_stderr_ready():
                     consume(decoder.decode(stdout.channel.recv_stderr(65536)))
+                if cancel_event and cancel_event.is_set():
+                    stop_command()
+                    raise PipelineCancelled("远端镜像命令已确认停止，后续部署已取消")
                 if interrupt_event and interrupt_event.is_set():
                     if interrupt_allowed and not interrupt_allowed():
                         interrupt_event.clear()
@@ -8265,6 +8372,11 @@ class DeployTool(QMainWindow):
                                 "镜像拉取已安全停止，准备重新合批"
                             )
                 now = time.monotonic()
+                if (now - command_started_at >= timeout_seconds or
+                        (idle_timeout_seconds and now - last_activity_at >= idle_timeout_seconds)):
+                    reason = "长时间没有远端输出" if idle_timeout_seconds and now - last_activity_at >= idle_timeout_seconds else "超过命令最长运行时间"
+                    stop_command()
+                    raise TimeoutError(f"远端命令超时（{reason}），已确认停止；后续步骤未执行")
                 if (
                     progress_range
                     and now - last_activity_at >= 10
@@ -8288,6 +8400,17 @@ class DeployTool(QMainWindow):
                 consume(decoder.decode(stdout.channel.recv_stderr(65536)))
             consume(decoder.decode(b"", final=True), final=True)
             code = stdout.channel.recv_exit_status()
+            if code == -1:
+                raise RemoteCommandUncertain("SSH 通道已断开但未取得退出状态，无法确认远端命令已停止；请检查服务器后重启工具")
+        except (PipelineCancelled, RemoteCommandUncertain):
+            raise
+        except Exception as exc:
+            if not stopped and code is None:
+                try:
+                    stop_command()
+                except RemoteCommandUncertain as uncertain:
+                    raise uncertain from exc
+            raise
         finally:
             if transfer_trace:
                 transfer_trace.finish(code)
@@ -8301,32 +8424,41 @@ class DeployTool(QMainWindow):
 
     @staticmethod
     def _quiet_remote_status(client, command):
-        _, stdout, stderr = client.exec_command(command)
-        stdout.read()
-        stderr.read()
-        return stdout.channel.recv_exit_status()
+        with ssh_request_deadline(client, 15):
+            _, stdout, stderr = client.exec_command(command, timeout=15)
+            stdout.read()
+            stderr.read()
+            return stdout.channel.recv_exit_status()
 
     def _terminate_remote_process_group(self, client, process_group_file):
         """Terminate only the managed image command group and verify it stopped."""
         pid_file = shell_quote(process_group_file)
         load_group = (
-            f"test -s {pid_file} || exit 2; "
+            f"i=0; while ! test -s {pid_file}; do "
+            '[ "$i" -ge 20 ] && exit 2; sleep 0.1; i=$((i+1)); done; '
             f"pgid=$(tr -d '[:space:]' < {pid_file}); "
-            "case $pgid in ''|*[!0-9]*) exit 3;; esac; "
+            "case $pgid in ''|*[!0-9]*) exit 3;; esac; [ \"$pgid\" -gt 1 ] || exit 3; "
         )
         term_status = self._quiet_remote_status(
-            client, load_group + "kill -TERM -- -$pgid"
+            client, load_group + "kill -0 -- -$pgid 2>/dev/null || exit 0; kill -TERM -- -$pgid"
         )
         if term_status:
             raise RuntimeError(f"远端进程组无法接收 TERM，退出码 {term_status}")
         alive_command = load_group + "kill -0 -- -$pgid 2>/dev/null"
+
+        def stopped():
+            status = self._quiet_remote_status(client, alive_command)
+            if status not in (0, 1):
+                raise RuntimeError(f"远端进程组停止确认失败，退出码 {status}")
+            return status == 1
+
         for _ in range(25):
-            if self._quiet_remote_status(client, alive_command) != 0:
+            if stopped():
                 return
             time.sleep(0.2)
         self._quiet_remote_status(client, load_group + "kill -KILL -- -$pgid")
         for _ in range(10):
-            if self._quiet_remote_status(client, alive_command) != 0:
+            if stopped():
                 return
             time.sleep(0.2)
         raise RuntimeError("远端镜像进程组在 KILL 后仍未退出")
@@ -8334,10 +8466,11 @@ class DeployTool(QMainWindow):
     @staticmethod
     def _remote_command_succeeded(client, command):
         """Run a quiet read-only probe and return whether it succeeded."""
-        _, stdout, stderr = client.exec_command(command)
-        stdout.read()
-        stderr.read()
-        return stdout.channel.recv_exit_status() == 0
+        with ssh_request_deadline(client, 30):
+            _, stdout, stderr = client.exec_command(command, timeout=30)
+            stdout.read()
+            stderr.read()
+            return stdout.channel.recv_exit_status() == 0
 
     @staticmethod
     def _probe_remote_image(client, image_ref):
@@ -8346,10 +8479,11 @@ class DeployTool(QMainWindow):
             "docker manifest inspect --insecure "
             f"{shell_quote(image_ref)} >/dev/null"
         )
-        _, stdout, stderr = client.exec_command(command)
-        stdout.read()
-        error = stderr.read().decode("utf-8", "replace").casefold()
-        code = stdout.channel.recv_exit_status()
+        with ssh_request_deadline(client, 30):
+            _, stdout, stderr = client.exec_command(command, timeout=30)
+            stdout.read()
+            error = stderr.read().decode("utf-8", "replace").casefold()
+            code = stdout.channel.recv_exit_status()
         if code == 0:
             return True, ""
         # Registry errors can contain credential-bearing URLs or headers. Emit
@@ -8376,6 +8510,15 @@ class DeployTool(QMainWindow):
         else:
             reason = "未识别的探测错误，原始输出已省略以保护认证信息"
         return False, f"镜像探测失败，是否存在尚无法确认（退出码 {code}）：{reason}"
+
+    @staticmethod
+    def _managed_transfer_command(workspace, command):
+        pid_file = posixpath.join(workspace, ".deploy-console-command.pgid")
+        body = (f"echo $$ > {shell_quote(pid_file)}; "
+                f"cd {shell_quote(workspace)} && exec sh -c {shell_quote(command)}")
+        # Disable job control so setsid does not fork; works with old setsid too.
+        wait_body = f"set +m; setsid sh -c {shell_quote(body)} & " + 'wait "$!"'
+        return f"sh -c {shell_quote(wait_body)}", pid_file
 
     @trace_operation("image_visibility_wait")
     def _wait_for_remote_image(
@@ -8520,6 +8663,8 @@ class DeployTool(QMainWindow):
 
     @trace_operation("ssh_deploy")
     def _execute_deploy(self, data, package, cancel_event=None):
+        if cancel_event and cancel_event.is_set():
+            raise PipelineCancelled("连接部署环境前已取消")
         data = resolve_ssh_environment_for_package(data, package)
         if data.get("delete_before_apply") is True:
             _deployment_delete_command(data)
@@ -8532,9 +8677,12 @@ class DeployTool(QMainWindow):
             self.emit("deploy_log", f"连接 {data['host']}:{data.get('port', '22')} ...")
             with trace_stage(self, "ssh_connect", host=data["host"], port=data.get("port", "22")):
                 connect_ssh_client(client, data)
+            if cancel_event and cancel_event.is_set():
+                raise PipelineCancelled("SSH 连接后已取消，未开始部署")
             self.emit("deploy_progress", (8, "SSH 已连接，正在更新镜像清单..."))
-            with trace_stage(self, "sftp_connect"):
+            with trace_stage(self, "sftp_connect"), ssh_request_deadline(client):
                 sftp = client.open_sftp()
+                sftp.get_channel().settimeout(30)
             yaml_path = posixpath.join(data["yaml_dir"], data["yaml_file"])
             with trace_stage(self, "yaml_read", yaml_path=yaml_path):
                 with sftp.open(yaml_path, "r") as remote_yaml:
@@ -8565,6 +8713,7 @@ class DeployTool(QMainWindow):
                 self.emit("deploy_progress", (78, "目标镜像已存在，跳过镜像搬运"))
             else:
                 workspace = ""
+                preserve_workspace = False
                 try:
                     with trace_stage(self, "workspace_prepare"):
                         workspace = self._create_isolated_image_workspace(
@@ -8578,12 +8727,15 @@ class DeployTool(QMainWindow):
                         raise PipelineCancelled("镜像配置完成，后续步骤已取消")
                     transfer_started_at = time.monotonic()
                     self.emit("deploy_progress", (15, "正在搬运镜像..."))
+                    managed_command, pid_file = DeployTool._managed_transfer_command(workspace, data["pull_command"])
                     with trace_stage(self, "image_transfer"):
                         self._remote_exec(
                             client,
-                            f"cd {shell_quote(workspace)} && {data['pull_command']}",
+                            managed_command,
                             progress_range=(15, 78),
                             transfer_images=[target_image],
+                            process_group_file=pid_file,
+                            cancel_event=cancel_event,
                         )
                     self.emit(
                         "deploy_log",
@@ -8594,9 +8746,13 @@ class DeployTool(QMainWindow):
                         client, target_image, cancel_event=cancel_event
                     )
                     self.emit("deploy_log", f"目标镜像已确认可见：{target_image}")
+                except RemoteCommandUncertain:
+                    preserve_workspace = True
+                    raise
                 finally:
-                    with trace_stage(self, "workspace_cleanup"):
-                        self._remove_isolated_image_workspace(sftp, workspace)
+                    if not preserve_workspace:
+                        with trace_stage(self, "workspace_cleanup"):
+                            self._remove_isolated_image_workspace(sftp, workspace)
             if cancel_event and cancel_event.is_set():
                 raise PipelineCancelled("镜像拉取步骤完成，后续步骤已取消")
             self.emit("deploy_progress", (82, "正在更新 Kubernetes YAML..."))
@@ -8613,6 +8769,9 @@ class DeployTool(QMainWindow):
             elapsed = time.monotonic() - started_at
             self.emit("deploy_progress", (100, f"部署完成，共耗时 {elapsed:.1f} 秒"))
             self.emit("deploy_log", f"部署流程执行完成，总耗时 {elapsed:.1f} 秒")
+        except RemoteCommandUncertain as exc:
+            DeployTool._block_deployment_target(self, self._deployment_target_key("SSH 环境部署", data), exc)
+            raise
         finally:
             DeployTool._freeze_replaced_packages(self, data)
             client.close()
@@ -8632,6 +8791,8 @@ class DeployTool(QMainWindow):
             try:
                 with trace_stage(owner, "yaml_delete", yaml_path=yaml_path):
                     self._remote_exec(client, prefix + command)
+            except RemoteCommandUncertain:
+                raise
             except Exception as exc:
                 raise RuntimeError(f"删除 YAML 资源失败，已停止后续应用（可能已有部分资源被删除）：{yaml_path}；{exception_message(exc)}") from exc
         # Once deletion begins, finish apply even if cancellation was requested
@@ -8640,6 +8801,8 @@ class DeployTool(QMainWindow):
         try:
             with trace_stage(owner, "yaml_apply", yaml_path=yaml_path):
                 self._remote_exec(client, prefix + data["apply_command"])
+        except RemoteCommandUncertain:
+            raise
         except Exception as exc:
             if recreate:
                 raise RuntimeError(f"旧资源已删除，但重新应用失败，请检查并重试部署：{yaml_path}；{exception_message(exc)}") from exc
@@ -8683,6 +8846,8 @@ class DeployTool(QMainWindow):
                     self._remote_exec(
                         client, f"cd {shell_quote(data['yaml_dir'])} && " + _deployment_delete_command(data),
                     )
+            except RemoteCommandUncertain:
+                raise
             except Exception as exc:
                 entry["result"] = f"删除失败：{exception_message(exc)}"
                 errors.append(f'{entry["package"]} {entry["result"]}')
@@ -8707,6 +8872,8 @@ class DeployTool(QMainWindow):
                 entry["result"] = (previous_error + "；" if previous_error else "") + (
                     "已重新应用以恢复资源" if recovering else "应用成功"
                 )
+            except RemoteCommandUncertain:
+                raise
             except Exception as exc:
                 entry["result"] = (previous_error + "；" if previous_error else "") + f"应用失败：{exception_message(exc)}"
                 errors.append(f'{entry["package"]} {entry["result"]}')
@@ -8720,6 +8887,7 @@ class DeployTool(QMainWindow):
         if unified_apply:
             parse_deployment_packages("\n".join(entry["package"] for entry in entries))
         coordinator = getattr(self.window_manager, "batch_coordinator", None)
+        batch_cancel = DeploymentCancellation([entry["owner"] for entry in entries], require_all=True)
         if coordinator and batch_token:
             coordinator.set_phase(batch_token, "preparing")
             if coordinator.should_join_before_transfer(batch_token):
@@ -8727,7 +8895,7 @@ class DeployTool(QMainWindow):
                     combined = coordinator.collect_pending_entries(
                         batch_token,
                         entries,
-                        self.cancel_event,
+                        batch_cancel,
                         lambda count: self.emit(
                             "deploy_progress",
                             (0, f"检测到 {count} 个同环境任务，等待打包后一起拉镜像..."),
@@ -8762,6 +8930,7 @@ class DeployTool(QMainWindow):
             if entry["environment"].get("delete_before_apply") is True:
                 _deployment_delete_command(entry["environment"])
         owners = list({id(entry["owner"]): entry["owner"] for entry in active}.values())
+        transfer_cancel = DeploymentCancellation(owners)
         leader_run = getattr(getattr(self, "_diagnostics", None), "run_id", "")
         participants = [getattr(getattr(owner, "_diagnostics", None), "run_id", "")
                         for owner in owners]
@@ -8787,11 +8956,12 @@ class DeployTool(QMainWindow):
             for entry in active
         })
         acquired = []
+        connected = False
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             for key in lock_keys:
-                self._wait_for_deployment_target(key, log_target="deploy_log")
+                self._wait_for_deployment_target(key, cancel_event=transfer_cancel, log_target="deploy_log")
                 acquired.append(key)
             for entry in active:
                 DeployTool._start_ssh_replaced_packages(
@@ -8801,12 +8971,16 @@ class DeployTool(QMainWindow):
             broadcast("deploy_progress", (2, f"合并部署 {len(active)} 个包，正在连接 SSH..."))
             with trace_stage(self, "ssh_connect", host=data["host"], port=data.get("port", "22")):
                 connect_ssh_client(client, data)
-            with trace_stage(self, "sftp_connect"):
+            connected = True
+            with trace_stage(self, "sftp_connect"), ssh_request_deadline(client):
                 sftp = client.open_sftp()
+                sftp.get_channel().settimeout(30)
             transfer_packages = []
             for entry in active:
                 environment = entry["environment"]
                 package = entry["package"]
+                if transfer_cancel.is_set():
+                    raise PipelineCancelled("镜像校验期间已取消")
                 yaml_path = posixpath.join(
                     environment["yaml_dir"], environment["yaml_file"]
                 )
@@ -8843,7 +9017,7 @@ class DeployTool(QMainWindow):
                     combined = coordinator.collect_pending_entries(
                         batch_token,
                         entries,
-                        self.cancel_event,
+                        batch_cancel,
                         lambda count: broadcast(
                             "deploy_progress",
                             (0, f"拉镜像前发现 {count} 个新任务，等待打包后重新合批..."),
@@ -8854,26 +9028,13 @@ class DeployTool(QMainWindow):
 
             if transfer_packages:
                 workspace = ""
+                preserve_workspace = False
                 try:
                     with trace_stage(self, "workspace_prepare"):
                         workspace = self._create_isolated_image_workspace(
                             sftp, data, transfer_packages
                         )
-                    pid_file = posixpath.join(
-                        workspace, ".deploy-console-command.pgid"
-                    )
-                    managed_body = (
-                        f"echo $$ > {shell_quote(pid_file)}; "
-                        f"cd {shell_quote(workspace)}; "
-                        f"exec sh -c {shell_quote(data['pull_command'])}"
-                    )
-                    # Launch without job control so setsid is not a group leader
-                    # and will not fork. Shell wait also works on old setsid.
-                    wait_body = (
-                        f"set +m; setsid sh -c {shell_quote(managed_body)} & "
-                        'wait "$!"'
-                    )
-                    managed_command = f"sh -c {shell_quote(wait_body)}"
+                    managed_command, pid_file = DeployTool._managed_transfer_command(workspace, data["pull_command"])
                     if coordinator and batch_token:
                         coordinator.set_phase(batch_token, "pull")
                     with trace_stage(self, "image_transfer"):
@@ -8884,6 +9045,7 @@ class DeployTool(QMainWindow):
                             transfer_images=[entry["target_image"] for entry in active
                                              if entry["package"] in transfer_packages],
                             on_image_progress=update_image_progress,
+                            cancel_event=transfer_cancel,
                             interrupt_event=(
                                 coordinator.interrupt_event(batch_token)
                                 if coordinator and batch_token
@@ -8907,7 +9069,7 @@ class DeployTool(QMainWindow):
                             ),
                         )
                     for entry in active:
-                        if entry.get("target_image"):
+                        if entry.get("target_image") and not entry["owner"].cancel_event.is_set():
                             self._wait_for_remote_image(
                                 client,
                                 entry["target_image"],
@@ -8918,9 +9080,13 @@ class DeployTool(QMainWindow):
                                 f"目标镜像已确认可见：{entry['target_image']}",
                             )
                             entry["owner"].emit("deploy_progress", (78, "目标镜像已确认，等待部署..."))
+                except RemoteCommandUncertain:
+                    preserve_workspace = True
+                    raise
                 finally:
-                    with trace_stage(self, "workspace_cleanup"):
-                        self._remove_isolated_image_workspace(sftp, workspace)
+                    if not preserve_workspace:
+                        with trace_stage(self, "workspace_cleanup"):
+                            self._remove_isolated_image_workspace(sftp, workspace)
             else:
                 broadcast("deploy_progress", (78, "本轮镜像均已存在，跳过搬运"))
 
@@ -8931,7 +9097,7 @@ class DeployTool(QMainWindow):
                     combined = coordinator.collect_pending_entries(
                         batch_token,
                         entries,
-                        self.cancel_event,
+                        batch_cancel,
                         lambda count: broadcast(
                             "deploy_progress",
                             (0, f"应用 YAML 前发现 {count} 个新任务，重新合批..."),
@@ -8954,6 +9120,8 @@ class DeployTool(QMainWindow):
             for index, entry in enumerate(remaining, 1):
                 environment = entry["environment"]
                 owner = entry["owner"]
+                if owner.cancel_event.is_set():
+                    continue
                 owner.emit(
                     "deploy_progress",
                     (80, f"正在更新并应用 YAML（{index}/{len(remaining)}）..."),
@@ -8965,10 +9133,25 @@ class DeployTool(QMainWindow):
                         lambda text, package=entry["package"]: update_yaml_image(text, package),
                         allow_unchanged=True,
                     )
-                DeployTool._apply_deployment_yaml(
-                    self, client, environment, owner=owner, cancel_event=owner.cancel_event,
-                )
+                try:
+                    DeployTool._apply_deployment_yaml(
+                        self, client, environment, owner=owner, cancel_event=owner.cancel_event,
+                    )
+                except PipelineCancelled:
+                    continue
                 owner.emit("deploy_progress", (100, "合并部署完成"))
+        except RemoteCommandInterrupted:
+            raise
+        except PipelineCancelled:
+            remaining = [entry for entry in active if not entry["owner"].cancel_event.is_set()]
+            if remaining and not unified_apply:
+                raise BatchReassembled(remaining)
+            raise
+        except RemoteCommandUncertain as exc:
+            if connected:
+                for key in acquired:
+                    DeployTool._block_deployment_target(self, key, exc)
+            raise
         finally:
             for entry in active:
                 DeployTool._freeze_replaced_packages(entry["owner"], entry["environment"])
@@ -9133,7 +9316,81 @@ class DeployTool(QMainWindow):
     def _cloud_api_is_alive(self):
         return bool(self.ops_api and self.ops_api.authenticated)
 
+    @staticmethod
+    def _cloud_login_identity(settings):
+        return (
+            settings["url"].strip().rstrip("/"), settings["username"].strip(),
+            hashlib.sha256(settings["password_plain"].encode()).digest(),
+        )
+
+    def _discard_cloud_session(self, expected_identity=None):
+        with self._ops_session_state_lock:
+            self._ops_session_generation += 1
+            self.ops_api = None
+            self._ops_api_identity = None
+            self._ops_expected_identity = expected_identity
+        self._ops_maintenance_failed = False
+
+    def _maintain_cloud_session(self):
+        if self._ops_session_disposed.is_set():
+            return
+        if self._ops_session_thread and self._ops_session_thread.is_alive():
+            return
+        with self._ops_session_state_lock:
+            client = self.ops_api
+            generation = self._ops_session_generation
+            identity = self._ops_api_identity
+        if client is None or identity is None or not client.maintenance_due():
+            return
+
+        def maintain():
+            failed = False
+            try:
+                client.maintain_session()
+            except Exception:
+                failed = True
+            if not self._ops_session_disposed.is_set():
+                try:
+                    self.sig_cloud_session_result.emit({
+                        "generation": generation, "client": client,
+                        "initial": False, "failed": failed,
+                    })
+                except RuntimeError:
+                    # The task widget may have been removed while HTTP was pending.
+                    pass
+
+        # Idle maintenance must not keep a removable task or application alive.
+        self._ops_session_thread = threading.Thread(target=maintain, daemon=True)
+        self._ops_session_thread.start()
+
+    @Slot(object)
+    def _on_cloud_session_result(self, result):
+        if self._ops_session_disposed.is_set():
+            return
+        with self._ops_session_state_lock:
+            if result["generation"] != self._ops_session_generation:
+                return
+            if result["client"] is not self.ops_api:
+                return
+        if result["initial"]:
+            if result["failed"]:
+                self._on_cloud_status("登录失败")
+                self._on_cloud_log(f'Ops API 登录失败：{result["error"]}')
+            else:
+                self._on_cloud_log("Ops API 登录成功。")
+                self._on_cloud_status("已登录")
+            return
+        if result["failed"] and not self._ops_maintenance_failed:
+            self._on_cloud_log("Ops 会话维护暂未成功，将自动重试；也可重新登录。")
+        elif not result["failed"] and self._ops_maintenance_failed:
+            self._on_cloud_log("Ops 会话维护已恢复。")
+        self._ops_maintenance_failed = result["failed"]
+
     def _invalidate_cloud_account(self, _text=""):
+        self._discard_cloud_session(self._cloud_login_identity({
+            "url": self.cloud_url.text(), "username": self.cloud_username.text(),
+            "password_plain": self.cloud_password.text(),
+        }))
         for source in self._cloud_option_requests:
             self._cloud_option_requests[source] += 1
         self.build_cloud_target_dirty = True
@@ -9287,7 +9544,7 @@ class DeployTool(QMainWindow):
             return
         self._save_cloud_settings(settings)
         # Explicit login must also recover an expired API session.
-        self._ops_api_identity = None
+        self._discard_cloud_session(self._cloud_login_identity(settings))
         self._cloud_login_in_progress = True
         self.cloud_login_button.setEnabled(False)
         self.cloud_status_label.setText("正在登录...")
@@ -9630,29 +9887,48 @@ class DeployTool(QMainWindow):
             raise RuntimeError(f"Ops 登录失败：{reason}") from exc
 
     def _ensure_cloud_login(self, settings):
-        identity = (
-            settings["url"].strip().rstrip("/"), settings["username"].strip(),
-            hashlib.sha256(settings["password_plain"].encode()).digest(),
-        )
+        identity = self._cloud_login_identity(settings)
+        generation = self._ops_session_generation
         with self._ops_login_lock:
-            if self._cloud_api_is_alive() and self._ops_api_identity == identity:
-                return self.ops_api
+            with self._ops_session_state_lock:
+                if (self._ops_session_disposed.is_set()
+                        or generation != self._ops_session_generation
+                        or (self._ops_expected_identity is not None
+                            and self._ops_expected_identity != identity)):
+                    raise OpsApiError("Ops 登录信息已变更，请重新加载目标")
+                client = self.ops_api if self._ops_api_identity == identity else None
+            if client is not None:
+                client.maintain_session()
+                with self._ops_session_state_lock:
+                    if generation != self._ops_session_generation or self.ops_api is not client:
+                        raise OpsApiError("Ops 登录信息已变更，请重新加载目标")
+                return client
             self.emit("cloud_log", "正在通过 Ops API 登录...")
             try:
                 client = OpsApiClient()
                 client.login(
                     settings["url"], settings["username"], settings["password_plain"]
                 )
-                self.ops_api = client
-                self._ops_api_identity = identity
-                self.emit("cloud_log", "Ops API 登录成功。")
-                self.emit("cloud_status", "已登录")
+                with self._ops_session_state_lock:
+                    if generation != self._ops_session_generation:
+                        raise OpsApiError("Ops 登录信息已变更，请重新加载目标")
+                    self.ops_api = client
+                    self._ops_api_identity = identity
+                self.sig_cloud_session_result.emit({
+                    "generation": generation, "client": client,
+                    "initial": True, "failed": False,
+                })
                 return client
             except OpsApiError as exc:
-                self.ops_api = None
-                self._ops_api_identity = None
-                self.emit("cloud_status", "登录失败")
-                self.emit("cloud_log", f"Ops API 登录失败：{exception_message(exc)}")
+                with self._ops_session_state_lock:
+                    if generation != self._ops_session_generation:
+                        raise
+                    self.ops_api = None
+                    self._ops_api_identity = None
+                self.sig_cloud_session_result.emit({
+                    "generation": generation, "client": None, "initial": True,
+                    "failed": True, "error": exception_message(exc),
+                })
                 raise
 
     def _login_and_load_cloud(self, settings, source="tab", *, open_browser=False):
@@ -9755,8 +10031,15 @@ class DeployTool(QMainWindow):
             )
             self.emit("cloud_log", f'正在校验镜像包：{settings["package"]}')
             capture = getattr(self, "_replaced_packages", None)
+
+            def before_submit():
+                if cancel_event and cancel_event.is_set():
+                    raise PipelineCancelled("云端部署提交前已取消")
+                if capture is not None:
+                    capture.freeze()
+
             if capture is None:
-                result = api.deploy(settings)
+                result = api.deploy(settings, before_submit=before_submit)
             else:
                 def start_lookup(target):
                     # Isolate HTTP session/cache state from the submitting client.
@@ -9779,7 +10062,7 @@ class DeployTool(QMainWindow):
                     capture.start(settings["package"], read)
 
                 result = api.deploy(settings, on_target_resolved=start_lookup,
-                                    before_submit=capture.freeze)
+                                    before_submit=before_submit)
             target = result["target"]
             self.emit(
                 "cloud_log",

@@ -20,6 +20,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
 from shlex import quote as shell_quote
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -33,6 +34,8 @@ def load_deployment_code():
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     names = {
         "PipelineCancelled", "RemoteCommandInterrupted", "BatchReassembled",
+        "RemoteCommandUncertain", "DeploymentCancellation",
+        "ssh_request_deadline",
         "BatchDeploymentCoordinator", "exception_message", "ANSI_ESCAPE_RE",
         "TRANSFER_PROGRESS_RE", "clean_remote_output_line", "_transfer_bytes",
         "parse_transfer_progress", "format_transfer_bytes", "DockerImageProgress",
@@ -45,6 +48,7 @@ def load_deployment_code():
         "_create_isolated_image_workspace", "_remove_isolated_image_workspace",
         "_apply_deployment_yaml",
         "_start_ssh_replaced_packages", "_freeze_replaced_packages",
+        "_managed_transfer_command", "_block_deployment_target",
     }
     selected = []
     for node in tree.body:
@@ -194,6 +198,9 @@ class LocalPtyChannel:
 
 
 class LocalSftp:
+    def get_channel(self):
+        return SimpleNamespace(settimeout=lambda _seconds: None)
+
     def open(self, path, mode):
         return open(path, mode + "b")
 
@@ -211,7 +218,7 @@ class LocalClient:
         self.transfer_count = 0
         self.probed_before_completion = False
 
-    def exec_command(self, command, get_pty=False):
+    def exec_command(self, command, get_pty=False, timeout=None):
         if get_pty:
             if ".deploy-console-command.pgid" in command:
                 self.transfer_count += 1
@@ -482,6 +489,48 @@ class RemotePtyTests(unittest.TestCase):
         self.assertEqual((self.root / "received").read_text(), "etmfrontend:new\n")
         self.assertIn("etmbackend:old", (self.root / "backend.yaml").read_text())
         self.assertEqual(len(self.tool.updated), 1)
+        self.assert_clean()
+
+    def test_user_cancel_during_transfer_stops_process_and_skips_apply(self):
+        self.script(delay="0.6 & child=$!; trap 'wait $child; exit 143' TERM; wait $child")
+        self.tool.on_event = lambda target, message: (
+            self.tool.cancel_event.set() if target == "deploy_log" and message == "Pulling from local-test" else None)
+        with self.assertRaises(production.PipelineCancelled):
+            self.run_batch()
+        self.assertFalse((self.root / "completed").exists())
+        self.assertFalse((self.root / "applied").exists())
+        self.assert_clean()
+
+    def test_user_cancel_during_push_is_not_rebatch_restriction(self):
+        self.script(delay="0.6 & child=$!; trap 'wait $child; exit 143' TERM; wait $child")
+        script = self.root / "transfer.sh"
+        script.write_text(script.read_text().replace("Pulling from local-test", "The push refers to repository local-test"))
+        self.tool.on_event = lambda target, message: (
+            self.tool.cancel_event.set() if target == "deploy_log" and message == "The push refers to repository local-test" else None)
+        with self.assertRaises(production.PipelineCancelled):
+            self.run_batch()
+        self.assertFalse((self.root / "completed").exists())
+        self.assertFalse((self.root / "applied").exists())
+        self.assert_clean()
+
+    def test_cancelling_one_owner_reassembles_remaining_tasks(self):
+        self.script(delay="0.6 & child=$!; trap 'wait $child; exit 143' TERM; wait $child")
+        other = DeploymentHarness()
+        self.entries[1]["owner"] = other
+        self.tool.on_event = lambda target, message: (
+            self.tool.cancel_event.set() if target == "deploy_log" and message == "Pulling from local-test" else None)
+        with self.assertRaises(production.BatchReassembled) as caught:
+            self.run_batch()
+        self.assertEqual([entry["package"] for entry in caught.exception.entries], ["etmfrontend:new"])
+        self.assertFalse(other.cancel_event.is_set())
+        self.assertFalse((self.root / "completed").exists())
+        self.entries = caught.exception.entries
+        self.tool.on_event = lambda *_: None
+        self.client = LocalClient(self.root)
+        self.addCleanup(self.client.close)
+        self.run_batch()
+        self.assertIn("etmfrontend:new", (self.root / "frontend.yaml").read_text())
+        self.assertIn("etmbackend:old", (self.root / "backend.yaml").read_text())
         self.assert_clean()
 
 

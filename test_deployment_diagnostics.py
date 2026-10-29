@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from main import DeployTool, ReplacedPackageCapture
+from main import DeployTool, ReplacedPackageCapture, RemoteCommandUncertain
 from task_diagnostics import DiagnosticLog, TaskTrace
 
 
@@ -61,7 +61,7 @@ class DeploymentDiagnosticsTests(unittest.TestCase):
         self.assertTrue(any(r.get("operation") == "image_visibility_wait" and
                             r["event"] == "operation_end" for r in records))
 
-    def test_remote_read_failure_flushes_last_transfer_phase_and_preserves_error(self):
+    def test_remote_read_failure_flushes_phase_and_reports_unknown_remote_state(self):
         calls = [0]
         failure = OSError("password=FAKE_READ_ERROR")
 
@@ -72,13 +72,14 @@ class DeploymentDiagnosticsTests(unittest.TestCase):
             raise failure
 
         channel = SimpleNamespace(exit_status_ready=lambda: False, recv_ready=lambda: True,
-                                  recv=receive, recv_stderr_ready=lambda: False)
+                                  recv=receive, recv_stderr_ready=lambda: False, close=Mock())
         client = Mock()
         client.exec_command.return_value = (None, SimpleNamespace(channel=channel), None)
-        with patch("main.time.sleep"), self.assertRaises(OSError) as caught:
+        with patch("main.time.sleep"), self.assertRaises(RemoteCommandUncertain) as caught:
             DeployTool._remote_exec(self.owner, client, "fake-command", progress_range=(15, 78),
                                     transfer_images=["registry.example/etm:1"])
-        self.assertIs(caught.exception, failure)
+        self.assertIs(caught.exception.__cause__, failure)
+        channel.close.assert_called_once()
         records = self.records()
         self.assertTrue(any(r["event"] == "transfer_context_end" for r in records))
         end = next(r for r in records if r["event"] == "transfer_end")

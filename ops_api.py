@@ -30,6 +30,14 @@ class OpsApiError(RuntimeError):
     pass
 
 
+class OpsAuthenticationError(OpsApiError):
+    pass
+
+
+class OpsPermissionError(OpsApiError):
+    pass
+
+
 class OpsSubmissionUnknown(OpsApiError):
     pass
 
@@ -82,6 +90,11 @@ def target_regions(records, cloud):
 class OpsApiClient:
     """HTTP client that mirrors the Ops web application's authenticated API calls."""
 
+    SESSION_CHECK_SECONDS = 5 * 60
+    # Client renewal policy, not a claim about the IAM token's expiration time.
+    SESSION_RELOGIN_SECONDS = 30 * 60
+    READ_ONLY_POST_PATHS = frozenset(("/api/v1/deployment/data/app/group/multi",))
+
     def __init__(self, timeout=30, session=None):
         self.timeout = timeout
         self.session = session or requests.Session()
@@ -102,7 +115,13 @@ class OpsApiClient:
         self._targets = {}
         self._projects_cache = {}
         self._options_cache = {}
-        self._options_lock = threading.RLock()
+        self._session_lock = threading.RLock()
+        # Cache fills call BFF, and maintenance may log in during a cache fill.
+        # A shared reentrant lock also protects requests.Session from races.
+        self._options_lock = self._session_lock
+        self._credentials = None
+        self._last_session_check = 0.0
+        self._last_login = 0.0
 
     @staticmethod
     def _public_key_pem(value):
@@ -112,31 +131,56 @@ class OpsApiClient:
         return f"-----BEGIN PUBLIC KEY-----\n{value}\n-----END PUBLIC KEY-----".encode()
 
     def _json_request(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", self.timeout)
-        kwargs.setdefault("headers", self.headers)
-        try:
-            response = self.session.request(method, url, **kwargs)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            raise OpsApiError(f"Ops API 请求失败：{type(exc).__name__}") from exc
-        except ValueError as exc:
-            raise OpsApiError("Ops API 返回了无法解析的数据") from exc
-        if isinstance(payload, dict) and payload.get("code") not in (
-            None, 0, 200, 10000, "0", "200", "10000"
-        ):
-            raise OpsApiError(str(payload.get("msg") or payload.get("message") or "Ops API 返回失败"))
-        return payload
+        with self._session_lock:
+            kwargs.setdefault("timeout", self.timeout)
+            kwargs.setdefault("headers", self.headers)
+            endpoint = f"{method.upper()} {urlsplit(url).path}"
+            response = None
+            try:
+                response = self.session.request(method, url, **kwargs)
+                response.raise_for_status()
+                payload = response.json()
+            except requests.HTTPError as exc:
+                failed_response = exc.response if exc.response is not None else response
+                status = getattr(failed_response, "status_code", None)
+                if status == 401:
+                    self.authenticated = False
+                    raise OpsAuthenticationError(f"Ops 登录已失效（HTTP 401）：{endpoint}") from None
+                if status == 403:
+                    raise OpsPermissionError(f"Ops API 权限不足（HTTP 403）：{endpoint}") from None
+                reason = f"HTTP {status}" if isinstance(status, int) else "HTTPError"
+                raise OpsApiError(f"Ops API 请求失败（{reason}）：{endpoint}") from None
+            except requests.RequestException as exc:
+                raise OpsApiError(f"Ops API 请求失败（{type(exc).__name__}）：{endpoint}") from None
+            except ValueError:
+                raise OpsApiError(f"Ops API 返回了无法解析的数据：{endpoint}") from None
+            if isinstance(payload, dict) and payload.get("code") in (401, "401"):
+                self.authenticated = False
+                raise OpsAuthenticationError(f"Ops 登录已失效（401）：{endpoint}")
+            if isinstance(payload, dict) and payload.get("code") not in (
+                None, 0, 200, 10000, "0", "200", "10000"
+            ):
+                code = str(payload.get("code"))
+                code_hint = f"（code {code}）" if (
+                    code.isascii() and code.isdigit() and len(code) <= 8
+                ) else ""
+                raise OpsApiError(f"Ops API 返回失败{code_hint}：{endpoint}")
+            return payload
 
     @staticmethod
     def _data(payload):
         return payload.get("data", payload) if isinstance(payload, dict) else payload
 
     def login(self, platform_url, username, password):
-        self.authenticated = False
-        self._projects_cache.clear()
-        self._options_cache.clear()
-        self._targets.clear()
+        with self._session_lock:
+            self.authenticated = False
+            self._credentials = None
+            self._projects_cache.clear()
+            self._options_cache.clear()
+            self._targets.clear()
+            return self._login(platform_url, username, password)
+
+    def _login(self, platform_url, username, password):
         origin = f"{urlsplit(platform_url).scheme}://{urlsplit(platform_url).netloc}"
         app_info = self._json_request(
             "GET", f"{origin}/assets/appinfo/modules-cn.json", headers={"Client-Agent": "web"}
@@ -144,14 +188,14 @@ class OpsApiClient:
         app_token = app_info.get("appToken", "")
         if not app_token:
             raise OpsApiError("Ops 页面未返回应用认证信息")
-        self.headers = {
+        login_headers = {
             "Client-Agent": "web",
             "digi-middleware-auth-app": app_token,
             "digi-middleware-auth-user": "",
         }
 
         server_payload = self._json_request(
-            "GET", f"{IAM_BASE_URL}/api/iam/v2/identity/publickey"
+            "GET", f"{IAM_BASE_URL}/api/iam/v2/identity/publickey", headers=login_headers
         )
         server_key = serialization.load_pem_public_key(
             self._public_key_pem(server_payload.get("publicKey"))
@@ -171,6 +215,7 @@ class OpsApiClient:
             "POST",
             f"{IAM_BASE_URL}/api/iam/v2/identity/aeskey",
             json={"clientEncryptPublicKey": encrypted_public},
+            headers=login_headers,
         )
         aes_key = client_private.decrypt(
             base64.b64decode(aes_payload["encryptAesKey"]), padding.PKCS1v15()
@@ -184,6 +229,7 @@ class OpsApiClient:
         login_payload = self._json_request(
             "POST",
             f"{IAM_BASE_URL}/api/iam/v2/identity/login",
+            headers=login_headers,
             json={
                 "tenantId": "",
                 "userId": username,
@@ -196,14 +242,59 @@ class OpsApiClient:
         if not token:
             raise OpsApiError("Ops 登录成功响应中没有 Token")
         self.user = login_payload
-        self.headers["digi-middleware-auth-user"] = token
+        login_headers["digi-middleware-auth-user"] = token
+        self.headers = login_headers
         self.authenticated = True
+        self._credentials = (platform_url, username, password)
+        self._last_login = self._last_session_check = time.monotonic()
         return True
 
-    def _bff(self, method, path, **kwargs):
-        if not self.authenticated:
-            raise OpsApiError("Ops API 尚未登录")
-        return self._json_request(method, BFF_BASE_URL + path, **kwargs)
+    def maintenance_due(self):
+        """Nonblocking advisory check; maintain_session rechecks under its lock."""
+        now = time.monotonic()
+        return bool(self._credentials) and (
+            not self.authenticated
+            or now - self._last_session_check >= self.SESSION_CHECK_SECONDS
+            or now - self._last_login >= self.SESSION_RELOGIN_SECONDS
+        )
+
+    def maintain_session(self, force=False):
+        with self._session_lock:
+            if not self._credentials:
+                # Snapshot readers intentionally use copied authentication only.
+                if self.authenticated:
+                    return True
+                raise OpsAuthenticationError("Ops API 尚未登录，请重新登录")
+            now = time.monotonic()
+            if not self.authenticated or now - self._last_login >= self.SESSION_RELOGIN_SECONDS:
+                return self._login(*self._credentials)
+            if force or now - self._last_session_check >= self.SESSION_CHECK_SECONDS:
+                try:
+                    self._json_request(
+                        "POST", f"{IAM_BASE_URL}/api/iam/v2/identity/token/analyze", json={}
+                    )
+                except OpsAuthenticationError:
+                    return self._login(*self._credentials)
+                self._last_session_check = time.monotonic()
+            return True
+
+    def _bff(self, method, path, *, before_request=None, **kwargs):
+        with self._session_lock:
+            self.maintain_session()
+            if before_request is not None:
+                before_request()
+            try:
+                return self._json_request(method, BFF_BASE_URL + path, **kwargs)
+            except OpsAuthenticationError:
+                safe_read = method.upper() == "GET" or (
+                    method.upper() == "POST" and urlsplit(path).path in self.READ_ONLY_POST_PATHS
+                )
+                if not safe_read or not self._credentials:
+                    raise
+                self.maintain_session(force=True)
+                if before_request is not None:
+                    before_request()
+                return self._json_request(method, BFF_BASE_URL + path, **kwargs)
 
     def list_projects(self, cloud, *, refresh=False):
         with self._options_lock:
@@ -549,11 +640,21 @@ class OpsApiClient:
             "userName": self.user.get("userName", ""),
             "name": deploy_name,
         }
-        if before_submit:
-            before_submit()
+        submitted = False
+
+        def before_request():
+            nonlocal submitted
+            if before_submit is not None:
+                before_submit()
+            submitted = True
+
         try:
-            response = self._bff("POST", path, json=body, timeout=60)
+            response = self._bff(
+                "POST", path, json=body, timeout=60, before_request=before_request
+            )
         except OpsApiError as exc:
+            if not submitted:
+                raise
             raise OpsSubmissionUnknown(
                 "部署提交响应不明确，请先到 Ops 平台检查部署记录，禁止直接重试"
             ) from exc

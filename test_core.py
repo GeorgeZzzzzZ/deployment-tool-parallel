@@ -266,6 +266,7 @@ class CoreTests(unittest.TestCase):
             timeout=15,
             banner_timeout=15,
             auth_timeout=30,
+            channel_timeout=30,
             look_for_keys=False,
             allow_agent=False,
         )
