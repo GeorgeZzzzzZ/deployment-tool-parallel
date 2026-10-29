@@ -144,17 +144,46 @@ def reorder_parameters(parameters, path):
 
 
 def extract_package_number(text):
-    preferred = []
-    for line in (text or "").splitlines():
-        if "naming to" in line.lower():
-            preferred.extend(IMAGE_REF_RE.finditer(line))
-    if preferred:
-        return preferred[-1].group(0).rsplit("/", 1)[-1]
-    matches = list(IMAGE_REF_RE.finditer(text or ""))
-    if not matches:
-        return ""
-    value = matches[-1].group(0)
-    return value.rsplit("/", 1)[-1]
+    """Prefer Docker output packages; digests and cleanup are not build results."""
+    produced, fallback = [], []
+    push_repository = ""
+
+    def package_reference(reference):
+        try:
+            infer_package_target(reference)
+        except ValueError:
+            return ""
+        return reference.rsplit("/", 1)[-1]
+
+    for raw_line in (text or "").splitlines():
+        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_line).strip()
+        line = re.sub(r"^\[(?:\d{4}-\d{2}-\d{2}[ T])?\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]\s*", "", line)
+        line = re.sub(r"^--->\s+", "", line)
+        line = re.sub(r"^#\d+\s+(?:\d+(?:\.\d+)?s?\s+)?", "", line)
+        if re.match(r"^(?:[+$]\s|(?:Deleted|Untagged):)", line, re.I):
+            continue
+        tagged = re.match(r"^(?:naming to|Successfully tagged)\s+(\S+)(?:\s+(?:\d+(?:\.\d+)?s\s+)?done)?$", line, re.I)
+        if tagged:
+            push_repository = ""
+            package = package_reference(tagged[1])
+            if package:
+                produced.append(package)
+            continue
+        pushed = re.match(r"^The push refers to repository \[([^\]]+)\]$", line)
+        if pushed:
+            push_repository = pushed[1]
+        receipt = re.match(r"^([\w.-]+): digest: sha256:[a-fA-F0-9]{64}\s+size:\s*\d+", line)
+        if receipt and push_repository:
+            package = package_reference(push_repository + ":" + receipt[1])
+            if package:
+                produced.append(package)
+        # Retain legacy package echoes, but require a deployable product/service
+        # name so SHA digests, timestamps and registry ports cannot win fallback.
+        for match in IMAGE_REF_RE.finditer(line):
+            package = package_reference(match.group(0))
+            if package:
+                fallback.append(package)
+    return produced[-1] if produced else (fallback[-1] if fallback else "")
 
 
 def split_package_number(package):

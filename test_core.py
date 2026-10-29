@@ -1662,6 +1662,118 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(extract_package_number(log), PACKAGE)
 
+    def test_extract_classic_frontend_package_before_cleanup_digests(self):
+        package = "ermfrontend-hyx-5.2.0:4.0.2.3430"
+        digest = "sha256:a4dc81d1e297b22e6ae51302b55a38b1d2d7e2764a1be3e9a0f6bae5606cd3ac"
+        log = (
+            f"Successfully tagged registry.example:5000/industry/{package}\n"
+            "later unrelated.example/base:latest\n"
+            "+ docker rmi registry.example/industry/ermfrontend-hyx-5.2.0:old\n"
+            "Untagged: registry.example/industry/ermfrontend-hyx-5.2.0:old\n"
+            f"Deleted: {digest}\n"
+        )
+        self.assertEqual(extract_package_number(log), package)
+
+    def test_extract_package_supports_buildkit_and_dockerbuild_output_prefixes(self):
+        for package in ("ermfrontend-hyx-5.2.0:4.0.2.3430", PACKAGE,
+                        "pqmmobile-hbxx-2.1.0:4.0.0.1000.10007"):
+            for output in (f"#13 naming to registry.example/industry/{package} 0.0s done",
+                           f"---> Successfully tagged registry.example/industry/{package}"):
+                with self.subTest(package=package, output=output):
+                    log = f"[2026-10-29T17:20:00+08:00] \x1b[32m{output}\x1b[0m\nDeleted: sha256:" + "a" * 64
+                    self.assertEqual(extract_package_number(log), package)
+
+    def test_extract_package_reconstructs_tag_from_push_receipt_without_using_digest(self):
+        log = ("---> The push refers to repository [registry.example:5000/industry/ermfrontend-hyx-5.2.0]\n"
+               "---> 4.0.2.3430: digest: sha256:" + "b" * 64 + " size: 3442\n"
+               "Deleted: sha256:" + "a" * 64)
+        self.assertEqual(extract_package_number(log), "ermfrontend-hyx-5.2.0:4.0.2.3430")
+
+    def test_extract_package_keeps_legacy_package_output_but_ignores_trailing_noise(self):
+        log = f"镜像包号：registry.example/industry/{PACKAGE}\n17:20:30 build finished\nDeleted: sha256:" + "a" * 64
+        self.assertEqual(extract_package_number(log), PACKAGE)
+
+    def test_extract_package_never_uses_only_digest_cleanup_base_or_command_echo(self):
+        digest = "sha256:" + "a" * 64
+        cases = (
+            digest, "Deleted: " + digest, "#12 writing image " + digest + " done",
+            "Successfully tagged " + digest,
+            "Untagged: registry.example/industry/" + PACKAGE,
+            "[17:20:30] ---> Deleted: registry.example/industry/" + PACKAGE,
+            "+ docker rmi registry.example/industry/" + PACKAGE,
+            "+ echo 'naming to registry.example/industry/" + PACKAGE + " done'",
+            "---> + echo 'Successfully tagged " + PACKAGE + "'",
+            "FROM nginx:1.25\n17:20:30\nhttp://jenkins.example:8080",
+            "image: registry.example/industry/ermfrontend@" + digest,
+            "The push refers to repository [registry.example/industry/ermfrontend]\n" + digest,
+            "", None,
+        )
+        for log in cases:
+            with self.subTest(log=log):
+                self.assertEqual(extract_package_number(log), "")
+
+    def test_extract_package_prefers_latest_generated_image_over_later_old_reference(self):
+        log = ("#10 naming to registry.example/industry/ermfrontend:old done\n"
+               "Successfully tagged registry.example/industry/ermfrontend:new\n"
+               "previous package: ermfrontend:old\n")
+        self.assertEqual(extract_package_number(log), "ermfrontend:new")
+
+    def test_frontend_pipeline_deploys_tag_after_digest_cleanup_for_ssh_and_cloud(self):
+        package = "ermfrontend-hyx-5.2.0:4.0.2.3430"
+        for mode in ("SSH 环境部署", "云端部署"):
+            with self.subTest(mode=mode):
+                jenkins = Mock()
+                jenkins.wait_for_build.return_value = (
+                    {"result": "SUCCESS", "number": 4},
+                    f"Successfully tagged registry.example/industry/{package}\nDeleted: sha256:" + "a" * 64,
+                )
+                tool = SimpleNamespace(
+                    jenkins=jenkins, cancel_event=threading.Event(), emit=Mock(),
+                    _handle_build_output=Mock(), _handle_build_progress=Mock(),
+                    _raise_if_deploy_cancelled=Mock(), _run_cloud_deploy=Mock(), _execute_deploy=Mock(),
+                )
+                DeployTool._run_pipeline(
+                    tool, ["14-ERM", "1-WEB"], {}, "", mode,
+                    {"name": "fixture", "host": "fixture.example"}, {},
+                    {"project": "ERM", "deploy_type": "erm 前端", "cloud": "fixture", "region": "fixture"},
+                )
+                tool.emit.assert_any_call("package", package)
+                if mode == "SSH 环境部署":
+                    environment, deployed_package, _ = tool._execute_deploy.call_args.args
+                    self.assertEqual(deployed_package, package)
+                    self.assertEqual(environment["yaml_dir"], "/data/yaml/app/frontend")
+                    self.assertEqual(environment["yaml_file"], "erm.yaml")
+                else:
+                    self.assertEqual(tool._run_cloud_deploy.call_args.args[0]["package"], package)
+
+    def test_digest_only_successful_build_never_emits_package_or_starts_deployment(self):
+        for mode, deploy_after_build in (("SSH 环境部署", True), ("云端部署", True),
+                                         ("SSH 环境部署", False)):
+            with self.subTest(mode=mode, deploy_after_build=deploy_after_build):
+                jenkins = Mock()
+                jenkins.wait_for_build.return_value = (
+                    {"result": "SUCCESS", "number": 4}, "Deleted: sha256:" + "a" * 64,
+                )
+                events, deployments = [], []
+                tool = SimpleNamespace(
+                    jenkins=jenkins, cancel_event=threading.Event(),
+                    emit=lambda *event: events.append(event),
+                    _handle_build_output=lambda *_: None, _handle_build_progress=lambda *_: None,
+                    _raise_if_deploy_cancelled=lambda: None,
+                    _run_cloud_deploy=lambda *args: deployments.append(args),
+                    _execute_deploy=lambda *args: deployments.append(args),
+                )
+                DeployTool._run_pipeline(
+                    tool, ["14-ERM", "1-WEB"], {}, "", mode, {}, {}, {}, deploy_after_build,
+                )
+                self.assertFalse(any(kind == "package" for kind, _ in events))
+                self.assertEqual(deployments, [])
+                if deploy_after_build:
+                    self.assertTrue(any(kind == "error" and "未识别到包号" in value for kind, value in events))
+                else:
+                    self.assertIn(("build_status", "打包完成"), events)
+                    self.assertFalse(any(kind == "error" for kind, _ in events))
+
     def test_parameter_order_only_for_secondary_build(self):
         params = [{"name": "GIT_BRANCH"}, {"name": "X"}, {"name": "GIT_BRANCH2"}]
         result = reorder_parameters(params, "二开打包/16-ETM/3-SERVICE")

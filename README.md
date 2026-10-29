@@ -33,6 +33,7 @@ Windows、Linux 和 macOS 共用最新功能：Jenkins 自动登录、完整任�
 - `CUSTOM_NAME` 右侧的“刷新选项”直接读取当前 Jenkins 任务的最新候选项并更新缓存，保留当前填写值和其他参数；旧缓存中没有的手填值（如 `hbxx`）也不会被替换。刷新失败保留原列表；实际候选项以 Jenkins 配置为准。
 - 触发 Jenkins 构建，持续显示控制台日志、预计进度和最终结果。
 - 从构建日志中提取镜像包号。
+- 包号识别兼容 BuildKit 的 `naming to`、传统 Docker 的 `Successfully tagged` 和完整推送回执；忽略 `sha256` 摘要、镜像清理记录及 shell 命令回显。只有能识别产品与服务类型的镜像名和版本才作为包号，没有有效包号时停止自动部署。
 - 通过 SSH 更新镜像清单和 Kubernetes YAML，并执行环境发布命令。
 - 管理多套部署环境及其关联的 Kubernetes Dashboard。
 - 双击环境名称时使用系统默认浏览器打开环境页面，同时复制已保存的环境密码并提示账号。
