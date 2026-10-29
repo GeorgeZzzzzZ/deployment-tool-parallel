@@ -150,5 +150,139 @@ class TransferProgressTests(unittest.TestCase):
         self.assertTrue(all(percent < 46 for _image, percent, text in updates if "拉取" in text))
 
 
+class TransferLogTests(unittest.TestCase):
+    def run_transfer(self, schedule, images=None, exit_code=0, route_logs=False):
+        clock = [0.0]
+        steps = iter(schedule)
+        pending = [b""]
+        events, updates, image_logs = [], [], []
+
+        def next_step():
+            try:
+                clock[0], pending[0] = next(steps)
+                return False
+            except StopIteration:
+                return True
+
+        def receive(_size):
+            data, pending[0] = pending[0], b""
+            return data
+
+        channel = SimpleNamespace(
+            exit_status_ready=next_step, recv_ready=lambda: bool(pending[0]),
+            recv=receive, recv_stderr_ready=lambda: False,
+            recv_exit_status=lambda: exit_code,
+        )
+        client = Mock()
+        client.exec_command.return_value = (None, SimpleNamespace(channel=channel), None)
+        owner = SimpleNamespace(emit=lambda kind, value: events.append((clock[0], kind, value)))
+        kwargs = {}
+        if images:
+            kwargs["on_image_progress"] = lambda *update: updates.append(update)
+        if route_logs:
+            kwargs["on_image_log"] = lambda image, line: image_logs.append((image, line))
+        with patch("main.time.monotonic", side_effect=lambda: clock[0]), patch("main.time.sleep"):
+            if exit_code:
+                with self.assertRaisesRegex(RuntimeError, "命令退出码"):
+                    DeployTool._remote_exec(owner, client, "fixture", progress_range=(15, 78),
+                                            transfer_images=images, **kwargs)
+            else:
+                DeployTool._remote_exec(owner, client, "fixture", progress_range=(15, 78),
+                                        transfer_images=images, **kwargs)
+        return events, updates, image_logs
+
+    def test_real_download_extract_and_push_lines_survive_terminal_redraws(self):
+        output = (
+            "a: Downloading [=====>     ] 50MB/100MB\r"
+            "a: Download complete\n"
+            "\x1b[2Ka: Extracting [==>        ] 25MB/100MB\x1b[0m\r"
+            "a: Pull complete\n"
+            "The push refers to repository [registry.example/app]\n"
+            "a: Pushing [=======>   ] 75MB/100MB\r"
+        ).encode()
+        for images in (None, ["registry.example/app:1"]):
+            with self.subTest(images=images):
+                events, _, _ = self.run_transfer([(0, output)], images)
+                logs = [value for _, kind, value in events if kind == "deploy_log"]
+                self.assertIn("a: Downloading [=====>     ] 50MB/100MB", logs)
+                self.assertIn("a: Extracting [==>        ] 25MB/100MB", logs)
+                self.assertIn("a: Pushing [=======>   ] 75MB/100MB", logs)
+                self.assertLess(logs.index("a: Downloading [=====>     ] 50MB/100MB"),
+                                logs.index("a: Download complete"))
+                self.assertFalse(any("\x1b" in line for line in logs))
+
+    def test_fast_redraws_coalesce_but_latest_bytes_are_flushed_even_on_failure(self):
+        output = "".join(f"a: Downloading {i}MB/1000MB\r" for i in range(1, 501)).encode()
+        for exit_code in (0, 1):
+            with self.subTest(exit_code=exit_code):
+                events, _, _ = self.run_transfer([(0, output)], ["registry.example/app:1"], exit_code)
+                logs = [value for _, kind, value in events if kind == "deploy_log" and "Downloading" in value]
+                self.assertIn("a: Downloading 500MB/1000MB", logs)
+                self.assertLessEqual(len(logs), 2)
+
+    def test_pending_progress_is_flushed_while_remote_has_no_more_output(self):
+        events, _, _ = self.run_transfer([
+            (0, b"a: Downloading 5MB/100MB\r"),
+            (0.2, b"a: Downloading 10MB/100MB\r"),
+            (1.2, b""), (2.2, b""),
+        ], ["registry.example/app:1"])
+        self.assertIn((1.2, "deploy_log", "a: Downloading 10MB/100MB"), events)
+
+    def test_silence_reports_time_since_remote_output_without_inventing_progress(self):
+        events, updates, _ = self.run_transfer([
+            (0, b"a: Extracting 25MB/100MB\r"), (10, b""), (20, b""),
+        ], ["registry.example/app:1"])
+        logs = [value for _, kind, value in events if kind == "deploy_log"]
+        self.assertTrue(any("20 秒未收到远端输出" in line for line in logs), logs)
+        self.assertTrue(any("20 秒无进度或状态变化" in line for line in logs), logs)
+        self.assertTrue(any("无法确认" in line for line in logs), logs)
+        self.assertEqual(len({percent for _, percent, _ in updates}), 1)
+
+    def test_identical_redraws_do_not_count_as_progress_and_new_bytes_reset_wait(self):
+        line = b"a: Downloading 50MB/100MB\r"
+        events, _, _ = self.run_transfer([
+            (0, line), (10, line), (20, line),
+            (21, b"a: Downloading 60MB/100MB\r"), (25, b""), (31, b""),
+        ], ["registry.example/app:1"])
+        warnings = [(at, value) for at, kind, value in events
+                    if kind == "deploy_log" and "无进度或状态变化" in value]
+        self.assertTrue(any(at == 20 and "20 秒无进度或状态变化" in value and
+                            "0 秒未收到远端输出" in value for at, value in warnings), warnings)
+        self.assertFalse(any(at == 25 for at, _ in warnings))
+        self.assertTrue(any(at == 31 and "10 秒无进度或状态变化" in value for at, value in warnings))
+
+    def test_image_logs_follow_current_owner_and_do_not_go_to_other_batch_tasks(self):
+        self.assertIn("on_image_log", inspect.signature(DeployTool._remote_exec).parameters)
+        images = ["registry.example/first:1", "registry.example/second:1"]
+        events, _, image_logs = self.run_transfer([
+            (0, b"1: Pulling from first\na: Downloading 10MB/100MB\r"),
+            (1, b"1: Pulling from second\na: Extracting 20MB/100MB\r"),
+            (11, b""),
+        ], images, route_logs=True)
+        self.assertIn((images[0], "a: Downloading 10MB/100MB"), image_logs)
+        self.assertIn((images[1], "a: Extracting 20MB/100MB"), image_logs)
+        self.assertTrue(any(image == images[1] and "未收到远端输出" in line for image, line in image_logs))
+        self.assertFalse(any(image == images[0] and "Extracting" in line for image, line in image_logs))
+        self.assertFalse(any(kind == "deploy_log" and "Downloading" in value for _, kind, value in events))
+
+    def test_new_extraction_bytes_clear_stale_waiting_status_at_same_overall_percent(self):
+        _, updates, _ = self.run_transfer([
+            (0, b"a: Extracting 25MB/100MB\r"), (10, b""),
+            (11, b"a: Extracting 50MB/100MB\r"),
+        ], ["registry.example/app:1"])
+        self.assertEqual(len({percent for _, percent, _ in updates}), 1)
+        self.assertIn("多层汇总", updates[-1][2])
+
+    def test_each_layer_flushes_its_last_bytes_before_its_completion_status(self):
+        events, _, _ = self.run_transfer([(0, (
+            "a: Downloading 5MB/100MB\ra: Downloading 100MB/100MB\r"
+            "b: Downloading 5MB/100MB\rb: Downloading 80MB/100MB\r"
+            "a: Download complete\nb: Download complete\n"
+        ).encode())], ["registry.example/app:1"])
+        logs = [value for _, kind, value in events if kind == "deploy_log"]
+        self.assertLess(logs.index("a: Downloading 100MB/100MB"), logs.index("a: Download complete"))
+        self.assertLess(logs.index("b: Downloading 80MB/100MB"), logs.index("b: Download complete"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8203,6 +8203,7 @@ class DeployTool(QMainWindow):
         cancel_event=None,
         timeout_seconds=None,
         idle_timeout_seconds=None,
+        on_image_log=None,
     ):
         """Execute a remote command without flooding Qt with TTY redraws."""
         if cancel_event and cancel_event.is_set():
@@ -8224,9 +8225,30 @@ class DeployTool(QMainWindow):
         timeout_seconds = timeout_seconds if timeout_seconds is not None else (3600 if progress_range else 300)
         idle_timeout_seconds = idle_timeout_seconds if idle_timeout_seconds is not None else (600 if progress_range else 0)
         last_activity_at = command_started_at
+        last_change_at = command_started_at
         last_heartbeat_at = command_started_at
+        waiting_reported = False
+        last_output_by_layer = {}
+        pending_transfer_logs = {}
+        transfer_log_times = {}
         image_progress = DockerImageProgress(transfer_images, progress_range) if transfer_images and progress_range else None
         transfer_trace = RemoteTransferTrace(self) if progress_range else None
+
+        def report_log(line, image=""):
+            if image and on_image_log:
+                on_image_log(image, line)
+            else:
+                self.emit("deploy_log", line)
+
+        def flush_transfer_logs(now, force=False, only_key=None):
+            # Keep the newest real bytes per layer without flooding the Qt queue.
+            for key, line in list(pending_transfer_logs.items()):
+                if only_key is not None and key != only_key:
+                    continue
+                if force or now - transfer_log_times.get(key, float("-inf")) >= 1:
+                    report_log(line, key[0])
+                    transfer_log_times[key] = now
+                    del pending_transfer_logs[key]
 
         def report_progress(percent, status):
             if on_progress:
@@ -8243,7 +8265,8 @@ class DeployTool(QMainWindow):
 
         def consume(text, final=False):
             nonlocal pending, last_log_line, largest_total, last_progress
-            nonlocal transfer_phase, transfer_range, last_activity_at
+            nonlocal transfer_phase, transfer_range, last_activity_at, last_change_at
+            nonlocal waiting_reported
             if text:
                 last_activity_at = time.monotonic()
             pending += text.replace("\r\n", "\n").replace("\r", "\n")
@@ -8256,8 +8279,12 @@ class DeployTool(QMainWindow):
                 line = clean_remote_output_line(raw_line)
                 if not line:
                     continue
+                previous_image = image_progress.current_image if image_progress else ""
                 if image_progress:
                     report_image_progress(image_progress.feed(line))
+                image = image_progress.current_image if image_progress else ""
+                if image != previous_image:
+                    flush_transfer_logs(last_activity_at, force=True)
                 if transfer_trace:
                     transfer_trace.feed(
                         line, image=image_progress.current_image if image_progress else "",
@@ -8270,6 +8297,7 @@ class DeployTool(QMainWindow):
                 elif "pulling from" in lower_line or "downloading" in lower_line:
                     next_phase = "pull"
                 if next_phase and next_phase != transfer_phase and progress_range:
+                    flush_transfer_logs(last_activity_at, force=True)
                     transfer_phase = next_phase
                     if on_phase:
                         on_phase(next_phase)
@@ -8287,7 +8315,28 @@ class DeployTool(QMainWindow):
                     if not image_progress:
                         report_progress(transfer_range[0], status)
                 transfer = parse_transfer_progress(line)
+                layer = re.match(r"^(?:--->\s+)?([\w.-]+):\s+", line)
+                key = (image, transfer_phase, layer[1] if layer else "")
+                previous_line = last_output_by_layer.get(key)
+                changed = previous_line != line
+                if changed:
+                    last_output_by_layer[key] = line
+                    last_change_at = last_activity_at
+                    if waiting_reported:
+                        waiting_reported = False
+                        if image:
+                            report_image_progress(image_progress.states[image]["last"])
+                        elif not image_progress and progress_range:
+                            report_progress(max(progress_range[0], last_progress), "已收到新的远端输出...")
                 if transfer and transfer_range:
+                    if changed:
+                        # Show an action change (download -> extract) immediately.
+                        action = re.match(r"^(?:--->\s+)?[\w.-]+:\s+(\w+)", line)
+                        if action and previous_line and action[1] not in previous_line:
+                            flush_transfer_logs(last_activity_at, force=True, only_key=key)
+                            transfer_log_times.pop(key, None)
+                        pending_transfer_logs[key] = line
+                        flush_transfer_logs(last_activity_at, only_key=key)
                     if image_progress:
                         continue
                     current, total = transfer
@@ -8309,8 +8358,11 @@ class DeployTool(QMainWindow):
                                 f"{format_transfer_bytes(total)}",
                             )
                     continue
-                if line != last_log_line:
-                    self.emit("deploy_log", line)
+                if changed:
+                    flush_transfer_logs(last_activity_at, force=True,
+                                        only_key=key if layer and previous_line else None)
+                if changed or line != last_log_line:
+                    report_log(line, image)
                     last_log_line = line
 
         code = None
@@ -8372,6 +8424,7 @@ class DeployTool(QMainWindow):
                                 "镜像拉取已安全停止，准备重新合批"
                             )
                 now = time.monotonic()
+                flush_transfer_logs(now)
                 if (now - command_started_at >= timeout_seconds or
                         (idle_timeout_seconds and now - last_activity_at >= idle_timeout_seconds)):
                     reason = "长时间没有远端输出" if idle_timeout_seconds and now - last_activity_at >= idle_timeout_seconds else "超过命令最长运行时间"
@@ -8379,20 +8432,25 @@ class DeployTool(QMainWindow):
                     raise TimeoutError(f"远端命令超时（{reason}），已确认停止；后续步骤未执行")
                 if (
                     progress_range
-                    and now - last_activity_at >= 10
+                    and now - last_change_at >= 10
                     and now - last_heartbeat_at >= 10
                 ):
                     last_heartbeat_at = now
+                    waiting_reported = True
                     elapsed = int(now - command_started_at)
-                    phase_text = "推送" if transfer_phase == "push" else "拉取与校验"
+                    idle, unchanged = int(now - last_activity_at), int(now - last_change_at)
+                    waiting = (f"{idle} 秒未收到远端输出；"
+                               f"{unchanged} 秒无进度或状态变化，"
+                               "无法确认远端是否仍在推进")
+                    report_log(waiting, image_progress.current_image if image_progress else "")
+                    status = f"等待远端：{idle}s 无输出 / {unchanged}s 无变化"
                     heartbeat_progress = max(progress_range[0], last_progress)
                     if image_progress:
-                        report_image_progress(image_progress.heartbeat(elapsed))
+                        update = image_progress.heartbeat(elapsed)
+                        if update:
+                            report_image_progress((update[0], update[1], status))
                     else:
-                        report_progress(
-                            heartbeat_progress,
-                            f"镜像仍在{phase_text}，远端命令已运行 {elapsed} 秒...",
-                        )
+                        report_progress(heartbeat_progress, status)
                 time.sleep(0.02)
             while stdout.channel.recv_ready():
                 consume(decoder.decode(stdout.channel.recv(65536)))
@@ -8412,6 +8470,8 @@ class DeployTool(QMainWindow):
                     raise uncertain from exc
             raise
         finally:
+            if pending_transfer_logs:
+                flush_transfer_logs(time.monotonic(), force=True)
             if transfer_trace:
                 transfer_trace.finish(code)
         trace_event(self, "remote_exit", exit_code=code)
@@ -8951,6 +9011,11 @@ class DeployTool(QMainWindow):
                         trace_event(entry["owner"], "image_push_complete", image=image,
                                     wait_reason="remaining_batch_images_then_validation_and_apply")
 
+        def update_image_log(image, line):
+            for entry in active:
+                if entry.get("target_image") == image and not entry["owner"].cancel_event.is_set():
+                    entry["owner"].emit("deploy_log", line)
+
         lock_keys = sorted({
             self._deployment_target_key("SSH 环境部署", entry["environment"])
             for entry in active
@@ -9045,6 +9110,7 @@ class DeployTool(QMainWindow):
                             transfer_images=[entry["target_image"] for entry in active
                                              if entry["package"] in transfer_packages],
                             on_image_progress=update_image_progress,
+                            on_image_log=update_image_log,
                             cancel_event=transfer_cancel,
                             interrupt_event=(
                                 coordinator.interrupt_event(batch_token)

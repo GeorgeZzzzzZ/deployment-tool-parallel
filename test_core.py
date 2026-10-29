@@ -340,7 +340,8 @@ class CoreTests(unittest.TestCase):
         )
         self.assertIn("pulling image", log_text)
         self.assertIn("download complete", log_text)
-        self.assertNotIn("Downloading", log_text)
+        self.assertIn("layer: Downloading 38.06MiB/172MiB", log_text)
+        self.assertLess(log_text.index("38.06MiB/172MiB"), log_text.index("download complete"))
         self.assertTrue(any(
             call.args[0] == "deploy_progress"
             for call in tool.emit.call_args_list
@@ -385,7 +386,7 @@ class CoreTests(unittest.TestCase):
             for call in tool.emit.call_args_list
             if call.args[0] == "deploy_progress"
         ]
-        self.assertTrue(any("远端命令已运行 11 秒" in text for text in statuses))
+        self.assertTrue(any("11s 无输出 / 11s 无变化" in text for text in statuses))
         self.assertEqual(statuses[-1], "镜像搬运命令已结束，正在校验目标镜像...")
 
     @patch.object(DeployTool, "_terminate_remote_process_group")

@@ -118,6 +118,31 @@ class UiRegressionTests(unittest.TestCase):
             self.assertLess(save.geometry().right(), refresh.x())
             self.assertLessEqual(refresh.parentWidget().width() - refresh.geometry().right(), 2)
 
+    def test_remote_layer_bytes_reach_deployment_log_and_waiting_label_fits(self):
+        chunks = [b"a: Downloading [=====>     ] 50MB/100MB\r",
+                  b"a: Extracting [==>        ] 25MB/100MB\r"]
+        channel = SimpleNamespace(
+            exit_status_ready=lambda: not chunks, recv_ready=lambda: bool(chunks),
+            recv=lambda size: chunks.pop(0), recv_stderr_ready=lambda: False,
+            recv_exit_status=lambda: 0,
+        )
+        client = Mock()
+        client.exec_command.return_value = (None, SimpleNamespace(channel=channel), None)
+        with patch("main.time.sleep"):
+            self.task._remote_exec(client, "fixture", progress_range=(15, 78),
+                                   transfer_images=["registry.example/app:1"])
+        self.app.processEvents()
+        self.assertIn("Downloading [=====>     ] 50MB/100MB", self.task.deploy_log.toPlainText())
+        self.assertIn("Extracting [==>        ] 25MB/100MB", self.task.deploy_log.toPlainText())
+        self.task.tab_widget.setCurrentIndex(1)
+        for width in (1080, 1440):
+            self.manager.resize(width, 960)
+            self.task._on_deploy_progress(45, "等待远端：120s 无输出 / 120s 无变化")
+            self.app.processEvents()
+            self.assertGreater(self.task.deploy_progress.width(), 80)
+            label = self.task.deploy_progress_label
+            self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(label.text()))
+
     def test_delete_apply_option_fits_requested_positions_at_both_widths(self):
         for width in (1080, 1440):
             self.manager.resize(width, 960)

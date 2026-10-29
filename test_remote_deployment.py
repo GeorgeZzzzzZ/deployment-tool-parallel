@@ -366,6 +366,10 @@ class RemotePtyTests(unittest.TestCase):
             self.assertEqual(values, sorted(values))
             self.assertTrue(any(percent == 78 and "已确认" in text for percent, text in updates))
             self.assertEqual(updates[-1], (100, "合并部署完成"))
+        for owner, own_amount, other_amount in ((self.tool, 50, 25), (follower, 25, 50)):
+            logs = [payload for target, payload in owner.events if target == "deploy_log"]
+            self.assertIn(f"a: Downloading {own_amount}MB/100MB", logs)
+            self.assertNotIn(f"a: Downloading {other_amount}MB/100MB", logs)
         self.assert_clean()
 
     def test_cached_image_keeps_its_progress_while_other_image_transfers(self):
