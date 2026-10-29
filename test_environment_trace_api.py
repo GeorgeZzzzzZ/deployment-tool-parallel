@@ -3,6 +3,8 @@
 Evidence: https://cdm.digiwincloud.com.cn/4343-es2015.b6b359c152bb00ecc378.js
 getK8sInstance sends the history imageName as image_name; getInstance displays
 response.data.registry as runImageName. No authenticated response is saved here.
+Read-only verification on 2026-10-29 also found a classic deployment with empty
+v3 records but v1 records containing a valid imageName for the instance lookup.
 """
 
 import copy
@@ -31,6 +33,8 @@ class EnvironmentTraceApiTests(unittest.TestCase):
             "deleted_prod": "0", "deleted_pre": "0", "registryId": "industry",
         }]
         self.history = [{"imageName": HISTORY_IMAGE, "status": "pending"}]
+        self.legacy_history = []
+        self.expected_state = "prod"
         self.instance = {"registry": CURRENT_IMAGE, "instance_data": [], "envs": []}
         self.calls = []
         self.api._bff = Mock(side_effect=self.response)
@@ -50,6 +54,12 @@ class EnvironmentTraceApiTests(unittest.TestCase):
             return {"data": {"data": copy.deepcopy(self.records)}}
         if path == "/api/v3/deployment/record":
             return {"data": {"data": copy.deepcopy(self.history)}}
+        if path == "/api/v1/deployment/record":
+            self.assertEqual(kwargs["params"], {
+                "data_id": 111, "cloud": "Huawei", "state": self.expected_state,
+                "page_num": 1, "page_size": 1,
+            })
+            return {"code": 0, "data": {"data": copy.deepcopy(self.legacy_history)}}
         if path == "/api/v3/deployment/instance/data":
             return {"data": copy.deepcopy(self.instance)}
         self.fail(f"Unexpected request: {method} {path}")
@@ -67,10 +77,88 @@ class EnvironmentTraceApiTests(unittest.TestCase):
         self.assertEqual(result["target"]["id"], 111)
         self.assertEqual(result["target"]["state"], "prod")
         self.assertEqual(result["source"], "/api/v3/deployment/instance/data")
+        self.assertFalse(any(path == "/api/v1/deployment/record" for _, path, _ in self.calls))
         self.assertEqual(self.calls[-1][2]["params"], {
             "cloud": "Huawei", "area": "test", "app_id": "etm", "type": "backend",
             "deployment_name": "etm", "state": "prod", "image_name": HISTORY_IMAGE,
         })
+
+    def test_classic_history_only_supplies_hint_and_runtime_remains_authoritative(self):
+        self.history = []
+        self.legacy_history = [{"imageName": HISTORY_IMAGE, "status": "pending"}]
+        for region, state in (("测试", "prod"), ("预测试", "pre")):
+            with self.subTest(region=region):
+                self.expected_state = state
+                self.calls.clear()
+
+                result = self.load(region=region)
+
+                self.assertEqual(result["packages"], [CURRENT_IMAGE])
+                self.assertEqual(result["source"], "/api/v3/deployment/instance/data")
+                self.assertEqual(result["target"]["state"], state)
+                self.assertEqual(self.calls[-1][2]["params"]["image_name"], HISTORY_IMAGE)
+                self.assertEqual(self.calls[-1][2]["params"]["state"], state)
+                self.assertEqual(self.calls[-1][2]["params"]["area"], "test")
+
+    def test_classic_history_cannot_replace_missing_runtime_registry(self):
+        self.history = []
+        self.legacy_history = [{"imageName": HISTORY_IMAGE}]
+        self.instance["registry"] = None
+
+        with self.assertRaisesRegex(OpsApiError, "当前运行镜像"):
+            self.load()
+
+        self.assertEqual(self.calls[-1][1], "/api/v3/deployment/instance/data")
+
+    def test_classic_history_must_supply_a_complete_image_reference(self):
+        self.history = []
+        for rows in ([], None, {}, [None], [{"imageName": None}],
+                     [{"imageName": "5.3.0.1001.10400"}]):
+            with self.subTest(rows=rows):
+                self.legacy_history = rows
+                self.calls.clear()
+                with self.assertRaisesRegex(OpsApiError, "查询.*镜像|镜像.*查询"):
+                    self.load()
+                self.assertFalse(any("instance" in path for _, path, _ in self.calls))
+
+    def test_record_request_errors_are_not_treated_as_empty_history(self):
+        for failed_path in ("/api/v3/deployment/record", "/api/v1/deployment/record"):
+            with self.subTest(path=failed_path):
+                self.history = []
+                self.calls.clear()
+                def fail_record(method, path, **kwargs):
+                    if path == failed_path:
+                        raise OpsApiError("记录查询失败")
+                    return self.response(method, path, **kwargs)
+                self.api._bff.side_effect = fail_record
+
+                with self.assertRaisesRegex(OpsApiError, "记录查询失败"):
+                    self.load()
+
+                self.assertFalse(any(path == "/api/v1/deployment/record" or "instance" in path
+                                     for _, path, _ in self.calls))
+
+    def test_classic_lookup_preserves_timeout_and_cancels_between_requests(self):
+        self.history = []
+        self.legacy_history = [{"imageName": HISTORY_IMAGE}]
+        target = self.api._current_package_target(SETTINGS)
+        for cancel_after in ("/api/v3/deployment/record", "/api/v1/deployment/record"):
+            with self.subTest(cancel_after=cancel_after):
+                cancelled = threading.Event()
+                self.calls.clear()
+                def respond_and_cancel(method, path, **kwargs):
+                    result = self.response(method, path, **kwargs)
+                    if path == cancel_after:
+                        cancelled.set()
+                    return result
+                self.api._bff.side_effect = respond_and_cancel
+
+                with self.assertRaisesRegex(InterruptedError, "环境查询已取消"):
+                    self.api._load_current_packages_for_target(
+                        target, cancelled, request_timeout=8)
+
+                self.assertEqual(self.calls[-1][1], cancel_after)
+                self.assertTrue(all(kwargs["timeout"] == 8 for _, _, kwargs in self.calls))
 
     def test_pre_environment_queries_its_state_without_using_prod_history(self):
         result = self.load(region="预测试")

@@ -107,6 +107,8 @@ Jenkins 构建成功
 
 第四页新增“环境溯源”模式：任务路径确定产品与服务，云区复用目标缓存和 `SearchableComboBox`，但拥有独立选择与异步请求标识。未选任务也可选择当前账号已缓存的云区；无缓存时后台加载，选任务后过滤该服务并保留有效选择。失效选择及空选择在刷新后仍需手动选定，不自动回落到首项。当前环境镜像与构建信息共用下方结果详情。`OpsApiClient.load_current_packages` 每次重新读取精确部署单元；`/api/v3/deployment/record` 的 `imageName` 仅作查询参数，当前包只取 `/api/v3/deployment/instance/data` 返回的 `registry`（公开 Ops 前端同样赋给 `runImageName`）。使用原始 `area` 加 `state=prod/pre` 区分正常与预环境。拒绝多目标、裸版本及无效响应，不回退历史。UI 保存完整运行镜像，Jenkins 检索去掉环境仓库路径以兼容镜像搬运；来源仍需完整包名与 tag 的产出证据。取消在每次请求之间生效。回归见 `test_environment_trace_api.py`、`test_environment_trace_ui.py`。
 
+经典部署的 v3 记录可能为空，此时用相同 `data_id`、`cloud`、`state` 查询 `/api/v1/deployment/record`（`page_num=1&page_size=1`）获取实例查询用的镜像名。接口异常或格式错误不按空列表处理；当前包仍必须由实例接口确认。
+
 Jenkins 任务选择及加载环境后同步本地 YAML 预览，保持原 `env_dirty`，不自动保存。启动时冻结 `_preview_yaml`；最终包号与预览不符则停止，旧构建返回也不得覆盖新选任务预览。回归见 `test_deployment_preview.py`。
 
 TAB2 包号失焦或回车会同步两页的 YAML 目录、文件和应用命令，复用 `_apply_ssh_target_fields`；程序写入包号后的失焦不会覆盖所选 Jenkins 任务。删除后重新应用使用可记忆的滑动开关，两页同步；删除命令可编辑，按主机、端口和 YAML 路径保留当前任务的覆盖值，执行前冻结。回归见 `test_delete_apply.py`。

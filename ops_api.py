@@ -534,6 +534,17 @@ class OpsApiClient:
         ))
         self._check_environment_cancelled(cancel_event)
         records = payload.get("data") if isinstance(payload, dict) else payload
+        # Classic deployments may have v1 history while v3 returns an empty list.
+        # Keep the same target/state; history is only a hint for the runtime query.
+        if isinstance(records, list) and not records:
+            payload = self._data(self._bff(
+                "GET", "/api/v1/deployment/record",
+                params={"data_id": target["id"], "cloud": target["cloud"],
+                        "state": target["state"], "page_num": 1, "page_size": 1},
+                timeout=request_timeout,
+            ))
+            self._check_environment_cancelled(cancel_event)
+            records = payload.get("data") if isinstance(payload, dict) else payload
         hint = records[0].get("imageName") if (
             isinstance(records, list) and records and isinstance(records[0], dict)
         ) else None
